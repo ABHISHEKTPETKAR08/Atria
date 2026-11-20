@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# runtime data - never commit
+received.db
+received.db-wal
+received.db-shm
+collector_buffer.json
+collector_buffer.json.*
+collector_deadletter.json
+# deployment staging / az cli local config
+.deploy/
+.azure/
