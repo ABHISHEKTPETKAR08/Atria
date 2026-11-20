@@ -464,6 +464,34 @@ def insights():
     return jsonify(analyze())
 
 
+@app.get("/timeseries")
+def timeseries():
+    """Per-node metric history for the fleet charts, bucketed to <= ~240 points per node.
+    Ordered by capture time, so replayed (buffered) events land where they belong."""
+    try:
+        minutes = max(1, min(int(request.args.get("minutes", 15)), 60))
+    except ValueError:
+        minutes = 15
+    now = time.time()
+    window = minutes * 60
+    bucket = max(5.0, window / 240)
+    rows = get_db().execute(
+        "SELECT server_id, CAST(ts_epoch / ? AS INTEGER) AS b, AVG(ts_epoch) AS t, AVG(cpu_usage) AS cpu, "
+        "AVG(memory_usage) AS mem, AVG(bandwidth_mbps) AS bw, AVG(latency_ms) AS lat, MAX(packet_loss) AS loss, "
+        "COUNT(*) AS n "
+        "FROM events WHERE ts_epoch >= ? AND ts_epoch <= ? GROUP BY server_id, b ORDER BY server_id, b",
+        (bucket, now - window, now + MAX_FUTURE_SKEW_S)).fetchall()
+    series: dict[str, list] = {}
+    for r in rows:
+        series.setdefault(r["server_id"], []).append(
+            [round(r["t"], 3), round(r["cpu"], 1), round(r["mem"], 1), round(r["bw"], 3),
+             round(r["lat"], 2), round(r["loss"], 1), round(r["n"] * 60 / bucket, 1), r["b"]])
+    return jsonify(now=now, window_s=window, bucket_s=bucket,
+                   fields=["t", "cpu_usage", "memory_usage", "bandwidth_mbps", "latency_ms", "packet_loss",
+                           "events_per_min", "bucket"],
+                   series=series)
+
+
 @app.get("/health")
 def health():
     try:
@@ -488,53 +516,95 @@ DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Smart Observability · AIOps</title>
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
---green:#3fb950;--blue:#58a6ff;--yellow:#d29922;--red:#f85149;--gray:#6e7681}
+:root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--panel2:#1c2128;--border:#30363d;--grid:#21262d;--axis:#3d444d;
+--text:#e6edf3;--text2:#c9d1d9;--muted:#8b949e;
+/* categorical series slots (dark steps, validated on #161b22) - identity of each server */
+--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#0ca30c;--s7:#9085e9;--s8:#e66767;
+/* status palette - reserved for health, always paired with an icon + label */
+--good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b;--offline:#898781}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
 .mono,.rec{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .wrap{max-width:1440px;margin:0 auto;padding:20px 24px 40px}
 header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px}
 h1{font-size:20px;margin:0;font-weight:600}
 .sub{color:var(--muted);font-size:12px}
 .pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:999px;padding:4px 12px;font-size:12px;color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
-.dot.down{background:var(--red);animation:none}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.6)}70%{box-shadow:0 0 0 8px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--good);animation:pulse 2s infinite}
+.dot.down{background:var(--critical);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(12,163,12,.6)}70%{box-shadow:0 0 0 8px rgba(12,163,12,0)}100%{box-shadow:0 0 0 0 rgba(12,163,12,0)}}
 section{background:var(--panel);border:1px solid var(--border);border-radius:8px;margin-bottom:20px;overflow:hidden}
-section>h2{font-size:13px;font-weight:600;margin:0;padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:8px}
+section>h2{font-size:13px;font-weight:600;margin:0;padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+section>h2 a{color:var(--muted);font-weight:400;text-decoration:none}section>h2 a:hover{color:var(--text)}
 .feed{max-height:340px;overflow:auto}
-.rec{padding:10px 16px;border-bottom:1px solid var(--border);border-left:3px solid var(--gray);font-size:12.5px;white-space:pre-wrap;word-break:break-word}
+.rec{padding:10px 16px;border-bottom:1px solid var(--border);border-left:3px solid var(--offline);font-size:12.5px;white-space:pre-wrap;word-break:break-word}
 .rec:last-child{border-bottom:none}
-.rec.critical{border-left-color:var(--red);background:rgba(248,81,73,.07)}
-.rec.warning{border-left-color:var(--yellow);background:rgba(210,153,34,.07)}
-.rec.info{border-left-color:var(--blue);background:rgba(88,166,255,.05)}
-.rec .act{color:var(--green)}
+.rec.critical{border-left-color:var(--critical);background:rgba(208,59,59,.08)}
+.rec.warning{border-left-color:var(--warning);background:rgba(250,178,25,.06)}
+.rec .act{color:var(--text2)}.rec .act b{color:var(--muted);font-weight:600}
 .rec .meta{color:var(--muted);font-size:11px;margin-top:2px}
-.ok{padding:14px 16px;color:var(--green)}
+.ok{padding:14px 16px;color:var(--text2)}.ok i{color:var(--good);font-style:normal;margin-right:6px}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:20px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
 .card .label{color:var(--muted);font-size:12px}
-.card .value{font-size:26px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
-.v-red{color:var(--red)}.v-green{color:var(--green)}.v-yellow{color:var(--yellow)}
+.card .value{font-size:26px;font-weight:600;margin-top:2px;display:flex;align-items:center;gap:8px}
+.card .value[data-s]::before{content:"";width:10px;height:10px;border-radius:50%;background:var(--good)}
+.card .value[data-s="bad"]::before{background:var(--critical)}
 .scroll{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:8px 16px;border-bottom:1px solid var(--border);white-space:nowrap}
 th{color:var(--muted);font-weight:500;font-size:12px;background:var(--panel2)}
 tr:last-child td{border-bottom:none}
 td.mono{font-size:12.5px}
-.badge{display:inline-block;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid}
-.b-Excellent{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}
-.b-Good{color:var(--blue);border-color:rgba(88,166,255,.45);background:rgba(88,166,255,.12)}
-.b-Fair{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}
-.b-Poor{color:var(--red);border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.12)}
-.b-OFFLINE{color:var(--muted);border-color:var(--red);background:rgba(110,118,129,.18)}
-.b-none{color:var(--muted);border-color:var(--border)}
-.bar{display:inline-block;width:56px;height:6px;background:var(--border);border-radius:3px;margin-right:8px;vertical-align:middle;overflow:hidden}
-.bar>i{display:block;height:100%}
+.key{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px;vertical-align:-1px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border-radius:999px;font-size:12px;font-weight:500;border:1px solid var(--border);color:var(--text)}
+.badge i{font-style:normal;font-weight:700}
+.st-good{border-color:rgba(12,163,12,.55);background:rgba(12,163,12,.12)}.st-good i{color:var(--good)}
+.st-good2{border-color:rgba(12,163,12,.55)}.st-good2 i{color:var(--good)}
+.st-warning{border-color:rgba(250,178,25,.55);background:rgba(250,178,25,.10)}.st-warning i{color:var(--warning)}
+.st-critical{border-color:rgba(208,59,59,.6);background:rgba(208,59,59,.14)}.st-critical i{color:var(--critical)}
+.st-offline{border-color:var(--border);background:rgba(137,135,129,.14);color:var(--muted)}.st-offline i{color:var(--offline)}
+.st-none{color:var(--muted)}
+.bar{display:inline-block;width:56px;height:6px;background:var(--grid);border-radius:3px;margin-right:8px;vertical-align:middle;overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:3px}
 .muted{color:var(--muted)}
 .empty{padding:14px 16px;color:var(--muted)}
 footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
+/* packet tracer */
+#topo{display:block;width:100%;height:auto;max-height:440px}
+#topo text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+#topo .nm{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;fill:var(--text)}
+#topo .node{cursor:pointer;outline:none;transition:opacity .2s}
+#topo .node:focus-visible circle.ring{stroke-width:5}
+#topo .lnk{transition:opacity .2s}
+.tlegend{display:flex;flex-wrap:wrap;gap:18px;padding:10px 16px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+.tlegend span{display:inline-flex;align-items:center;gap:6px}
+.g{display:inline-block;border-radius:50%}
+/* charts */
+.filters{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:12px 16px;border-bottom:1px solid var(--border)}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.seg button{background:none;border:0;border-right:1px solid var(--border);color:var(--muted);padding:4px 12px;font:inherit;font-size:12px;cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button[aria-pressed="true"]{background:var(--panel2);color:var(--text);font-weight:600}
+.seg button:hover{color:var(--text)}
+.legend{display:flex;flex-wrap:wrap;gap:6px}
+.legend button{display:inline-flex;align-items:center;gap:8px;background:none;border:1px solid transparent;border-radius:6px;color:var(--text2);padding:3px 8px;font:inherit;font-size:12px;cursor:pointer}
+.legend button:hover{border-color:var(--border)}
+.legend button[aria-pressed="false"]{color:var(--muted);text-decoration:line-through}
+.legend button[aria-pressed="false"] .lk{opacity:.3}
+.lk{display:inline-block;width:16px;height:2px;border-radius:1px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(560px,1fr));margin:0 -1px -1px 0}
+.chart{background:var(--panel);padding:12px 14px 6px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+.chart h3{margin:0;font-size:13px;font-weight:600}.chart h3 small{color:var(--muted);font-weight:400;margin-left:6px}
+.chart .plot{position:relative;margin-top:6px}
+.chart svg{display:block;outline:none}
+.chart svg:focus-visible{box-shadow:0 0 0 2px var(--s1);border-radius:4px}
+#tip{position:fixed;z-index:10;pointer-events:none;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.4);display:none;min-width:170px}
+#tip .th{color:var(--muted);margin-bottom:4px}
+#tip .tr{display:flex;align-items:center;gap:8px;line-height:1.7}
+#tip .tr b{color:var(--text);font-variant-numeric:tabular-nums;min-width:64px}
+#tip .tr span{color:var(--muted)}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
 </style></head>
 <body><div class="wrap">
 <header>
@@ -554,11 +624,35 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 <div class="cards">
   <div class="card"><div class="label">Total events ingested</div><div class="value" id="c-total">0</div></div>
   <div class="card"><div class="label">Ingest rate (events / min)</div><div class="value" id="c-rate">0</div></div>
-  <div class="card"><div class="label">Active nodes</div><div class="value v-green" id="c-online">0</div></div>
+  <div class="card"><div class="label">Active nodes</div><div class="value" id="c-online">0</div></div>
   <div class="card"><div class="label">Offline nodes (&gt;60s silent)</div><div class="value" id="c-offline">0</div></div>
   <div class="card"><div class="label">Active alerts</div><div class="value" id="c-alerts">0</div></div>
   <div class="card"><div class="label">Duplicates blocked (idempotency)</div><div class="value" id="c-dups">0</div></div>
 </div>
+
+<section>
+  <h2><span>🛰 Live Packet Tracer · Edge servers → SaaS</span><span class="muted" id="topo-sub">each dot is a real event or probe</span></h2>
+  <svg id="topo" viewBox="0 0 1000 400" role="img" aria-label="Network topology of edge servers connected to the SaaS"></svg>
+  <div class="tlegend">
+    <span><i class="g" style="width:10px;height:10px;background:var(--text2)"></i>event packet (sanitized JSON)</span>
+    <span><i class="g" style="width:6px;height:6px;background:var(--muted)"></i>TCP probe</span>
+    <span><b style="color:var(--critical)">✕</b>dropped probe = packet loss</span>
+    <span><i class="g" style="width:6px;height:6px;background:var(--good)"></i>ACK (201 stored)</span>
+    <span><i class="lk" style="background:var(--good)"></i>link colour = node health</span>
+    <span><i class="g" style="width:10px;height:10px;border:2px solid var(--s1)"></i>ring colour = server (matches charts)</span>
+  </div>
+</section>
+
+<section>
+  <h2><span>📈 Fleet Telemetry · all servers together</span><a href="#tbl-events">Table view ↓</a></h2>
+  <div class="filters">
+    <div class="seg" id="range" role="group" aria-label="Time range">
+      <button data-m="5" aria-pressed="false">5 min</button><button data-m="15" aria-pressed="true">15 min</button><button data-m="60" aria-pressed="false">60 min</button>
+    </div>
+    <div class="legend" id="legend" aria-label="Servers (click to show/hide)"></div>
+  </div>
+  <div class="grid" id="charts"></div>
+</section>
 
 <section>
   <h2><span>🖥 Node Fleet</span><span class="muted">health: Excellent · Good · Fair · Poor · OFFLINE</span></h2>
@@ -568,7 +662,7 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
   </table></div>
 </section>
 
-<section>
+<section id="tbl-events">
   <h2><span>📡 Live Sanitized Telemetry</span><span class="muted">allow-listed fields only · newest first</span></h2>
   <div class="scroll"><table>
     <thead><tr><th>Captured (UTC)</th><th>Event ID</th><th>Node</th><th>CPU %</th><th>Mem %</th><th>Mbps</th><th>Latency ms</th><th>Loss %</th><th>Reported health</th></tr></thead>
@@ -577,61 +671,479 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 </section>
 <footer>Bearer-auth ingest · schema allow-list · idempotent event_id · SQLite WAL · alert latency = collector interval (5s) + UI refresh (3s) &lt; 10s</footer>
 </div>
+<div id="tip" role="tooltip"></div>
 <script>
+"use strict";
 const $ = id => document.getElementById(id);
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const num = (v, d = 1) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
-const color = (v, warn, crit) => v >= crit ? "var(--red)" : v >= warn ? "var(--yellow)" : "var(--green)";
-const bar = (v, warn, crit) => `<span class="bar"><i style="width:${Math.min(100, Math.max(0, v))}%;background:${color(v, warn, crit)}"></i></span>${num(v)}%`;
-const badge = s => `<span class="badge b-${esc(s || "none")}">${esc(s || "n/a")}</span>`;
-const ago = s => s < 60 ? `${Math.round(s)}s ago` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s ago`;
+const NS = "http://www.w3.org/2000/svg";
+const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// ---- identity (series colour follows the server, never its rank) ------------------------
+const SERIES = ["#3987e5","#d95926","#199e70","#c98500","#d55181","#0ca30c","#9085e9","#e66767"];
+const OTHER = "#6e7681";
+const slots = new Map();
+const colorOf = id => { if (!slots.has(id)) slots.set(id, slots.size < SERIES.length ? SERIES[slots.size] : OTHER); return slots.get(id); };
+const assign = ids => [...ids].filter(id => !slots.has(id)).sort().forEach(colorOf);
+
+// ---- status (health) - reserved colours, always icon + label -----------------------------
+const STATUS = {
+  Excellent: {cls: "st-good", icon: "✓", c: "var(--good)"},
+  Good:      {cls: "st-good2", icon: "✓", c: "var(--good)"},
+  Fair:      {cls: "st-warning", icon: "▲", c: "var(--warning)"},
+  Poor:      {cls: "st-critical", icon: "!", c: "var(--critical)"},
+  OFFLINE:   {cls: "st-offline", icon: "○", c: "var(--offline)"},
+};
+const st = s => STATUS[s] || {cls: "st-none", icon: "·", c: "var(--muted)"};
+const badge = s => `<span class="badge ${st(s).cls}"><i>${st(s).icon}</i>${esc(s || "n/a")}</span>`;
+const sev = (v, warn, crit) => v >= crit ? "var(--critical)" : v >= warn ? "var(--warning)" : "var(--good)";
+const meter = (v, warn, crit) => `<span class="bar"><i style="width:${Math.min(100, Math.max(0, v))}%;background:${sev(v, warn, crit)}"></i></span>${num(v)}%`;
+const ago = s => s < 60 ? `${Math.round(s)}s ago` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s ago`;
+const svg = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+const text = (parent, attrs, str) => { const t = svg("text", attrs, parent); t.textContent = str; return t; };
+
+const state = {nodes: [], ts: null, rangeMin: 15, hidden: new Set(), focus: null, hoverT: null};
+
+// ---- tooltip (DOM-built: names are untrusted, use textContent) ---------------------------
+const tip = $("tip");
+function showTip(x, y, title, rows) {
+  tip.replaceChildren();
+  const h = document.createElement("div"); h.className = "th"; h.textContent = title; tip.appendChild(h);
+  for (const r of rows) {
+    const row = document.createElement("div"); row.className = "tr";
+    const k = document.createElement("i"); k.className = r.dot ? "key" : "lk"; k.style.background = r.color;
+    if (r.dot) k.style.marginRight = "0";
+    const b = document.createElement("b"); b.textContent = r.value;
+    const s = document.createElement("span"); s.textContent = r.label;
+    row.append(k, b, s); tip.appendChild(row);
+  }
+  tip.style.display = "block";
+  const w = tip.offsetWidth, hh = tip.offsetHeight;
+  tip.style.left = Math.min(window.innerWidth - w - 8, x + 14) + "px";
+  tip.style.top = Math.max(8, Math.min(window.innerHeight - hh - 8, y - hh / 2)) + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+
+// ==========================================================================================
+// Packet tracer topology
+// ==========================================================================================
+const T = {W: 1000, H: 400, CX: 500, CY: 190, HW: 100, HH: 38, el: {}, pos: new Map(), packets: [], seen: null, ripples: 0};
+(function initTopo() {
+  const root = $("topo");
+  T.gLinks = svg("g", {}, root); T.gPk = svg("g", {}, root); T.gHub = svg("g", {}, root); T.gNodes = svg("g", {}, root);
+  T.ripples = svg("g", {}, T.gHub);
+  svg("rect", {x: T.CX - T.HW, y: T.CY - T.HH, width: T.HW * 2, height: T.HH * 2, rx: 12, fill: "#1c2128", stroke: "#58a6ff", "stroke-width": 1.5}, T.gHub);
+  text(T.gHub, {x: T.CX, y: T.CY - 12, "text-anchor": "middle", fill: "#e6edf3", "font-size": 14, "font-weight": 600}, "☁ Smart Observability SaaS");
+  text(T.gHub, {x: T.CX, y: T.CY + 6, "text-anchor": "middle", fill: "#8b949e", "font-size": 11}, "Tier-2 · POST /ingest · AIOps engine");
+  T.hubRate = text(T.gHub, {x: T.CX, y: T.CY + 23, "text-anchor": "middle", fill: "#c9d1d9", "font-size": 11}, "0 events / min");
+  T.empty = text(root, {x: T.CX, y: T.CY + 80, "text-anchor": "middle", fill: "#8b949e", "font-size": 13}, "Waiting for edge collectors to connect…");
+  requestAnimationFrame(frame);
+})();
+
+function hubEdge(x, y) {        // point on the hub rectangle's border towards (x, y)
+  const dx = x - T.CX, dy = y - T.CY, s = Math.min(T.HW / Math.abs(dx || 1e-6), T.HH / Math.abs(dy || 1e-6));
+  return [T.CX + dx * s, T.CY + dy * s];
+}
+function nodeEdge(p) {          // point on the node circle towards the hub
+  const dx = T.CX - p.x, dy = T.CY - p.y, d = Math.hypot(dx, dy) || 1;
+  return [p.x + dx / d * 30, p.y + dy / d * 30];
+}
+function layout(ids) {
+  const n = ids.length, RX = 375, RY = 128;
+  ids.forEach((id, i) => {
+    const a = n <= 2 ? [Math.PI, 0][i] : Math.PI + (i + 0.5) * 2 * Math.PI / n;
+    T.pos.set(id, {x: T.CX + RX * Math.cos(a), y: T.CY + RY * Math.sin(a)});
+  });
+}
+
+function updateTopo(nodes, counters) {
+  T.empty.style.display = nodes.length ? "none" : "";
+  T.hubRate.textContent = `${counters.events_last_min} events / min · ${counters.nodes_online}/${counters.nodes_total} nodes online`;
+  const ids = nodes.map(n => n.server_id);
+  layout(ids);
+  for (const id of Object.keys(T.el)) if (!ids.includes(id)) { T.el[id].link.remove(); T.el[id].g.remove(); delete T.el[id]; T.pos.delete(id); }
+  for (const n of nodes) {
+    const id = n.server_id, p = T.pos.get(id), s = st(n.status), off = n.status === "OFFLINE";
+    let e = T.el[id];
+    if (!e) {
+      e = T.el[id] = {};
+      e.link = svg("g", {class: "lnk"}, T.gLinks);
+      e.line = svg("line", {"stroke-width": 2, "stroke-linecap": "round"}, e.link);
+      e.g = svg("g", {class: "node", tabindex: 0, role: "img"}, T.gNodes);
+      e.hit = svg("circle", {r: 40, fill: "transparent"}, e.g);
+      e.ring = svg("circle", {class: "ring", r: 24, fill: "#1c2128", "stroke-width": 3}, e.g);
+      e.mon = svg("rect", {width: 20, height: 13, rx: 2, fill: "none", stroke: "#c9d1d9", "stroke-width": 1.6}, e.g);
+      e.stand = svg("path", {fill: "none", stroke: "#c9d1d9", "stroke-width": 1.6, "stroke-linecap": "round"}, e.g);
+      e.name = text(e.g, {class: "nm", "text-anchor": "middle"}, id);
+      e.stat = svg("text", {"text-anchor": "middle", "font-size": 12}, e.g);
+      e.icon = svg("tspan", {"font-weight": 700}, e.stat); e.slab = svg("tspan", {fill: "#c9d1d9"}, e.stat);
+      e.net = text(e.g, {"text-anchor": "middle", "font-size": 11.5, fill: "#8b949e", style: "font-variant-numeric:tabular-nums"}, "");
+      e.flash = text(e.g, {"text-anchor": "middle", "font-size": 12, fill: "#c9d1d9", opacity: 0}, "");
+      const enter = ev => { state.focus = id; applyFocus(); nodeTip(id, ev); };
+      e.g.addEventListener("pointerenter", enter); e.g.addEventListener("pointermove", ev => nodeTip(id, ev));
+      e.g.addEventListener("pointerleave", () => { state.focus = null; applyFocus(); hideTip(); });
+      e.g.addEventListener("focus", () => { state.focus = id; applyFocus(); const r = e.g.getBoundingClientRect(); nodeTip(id, {clientX: r.right, clientY: r.top + r.height / 2}); });
+      e.g.addEventListener("blur", () => { state.focus = null; applyFocus(); hideTip(); });
+    }
+    e.n = n;
+    const [x1, y1] = nodeEdge(p), [x2, y2] = hubEdge(p.x, p.y);
+    Object.entries({x1, y1, x2, y2, stroke: s.c, opacity: off ? .7 : .85, "stroke-dasharray": off ? "6 6" : "none"}).forEach(([k, v]) => e.line.setAttribute(k, v));
+    e.ring.setAttribute("cx", p.x); e.ring.setAttribute("cy", p.y); e.ring.setAttribute("stroke", colorOf(id));
+    e.ring.setAttribute("opacity", off ? .5 : 1);
+    e.hit.setAttribute("cx", p.x); e.hit.setAttribute("cy", p.y + 14);
+    e.mon.setAttribute("x", p.x - 10); e.mon.setAttribute("y", p.y - 10);
+    e.stand.setAttribute("d", `M${p.x} ${p.y + 3}v4M${p.x - 5} ${p.y + 8}h10`);
+    const below = p.y >= T.CY - 1 || ids.length <= 2;
+    e.name.setAttribute("x", p.x); e.name.setAttribute("y", below ? p.y + 46 : p.y - 68);
+    e.stat.setAttribute("x", p.x); e.stat.setAttribute("y", below ? p.y + 63 : p.y - 51);
+    e.net.setAttribute("x", p.x); e.net.setAttribute("y", below ? p.y + 79 : p.y - 35);
+    e.net.textContent = off ? "link down · no telemetry" : `${n.latency_ms < 10 ? num(n.latency_ms, 2) : num(n.latency_ms, 0)} ms · ${num(n.packet_loss)}% loss · ${num(n.bandwidth_mbps, 2)} Mbps`;
+    e.icon.textContent = s.icon + " "; e.icon.setAttribute("fill", s.c);
+    e.slab.textContent = off ? `OFFLINE · ${ago(n.last_seen_s)}` : `${n.status} · CPU ${num(n.cpu_usage, 0)}%`;
+    e.flash.setAttribute("x", p.x); e.flash.setAttribute("y", below ? p.y - 34 : p.y + 44);
+    e.g.setAttribute("aria-label", `${id}: ${n.status}, latency ${num(n.latency_ms)} ms, packet loss ${num(n.packet_loss)}%`);
+  }
+  applyFocus();
+}
+
+function nodeTip(id, ev) {
+  const n = (T.el[id] || {}).n; if (!n) return;
+  showTip(ev.clientX, ev.clientY, id, [
+    {color: st(n.status).c, dot: true, value: n.status, label: "health"},
+    {color: colorOf(id), value: num(n.cpu_usage) + "%", label: "CPU"},
+    {color: colorOf(id), value: num(n.memory_usage) + "%", label: "memory"},
+    {color: colorOf(id), value: num(n.latency_ms, 2) + " ms", label: `latency (baseline ${n.baseline_latency_ms === null ? "learning" : num(n.baseline_latency_ms, 2)})`},
+    {color: colorOf(id), value: num(n.packet_loss) + "%", label: "packet loss"},
+    {color: colorOf(id), value: num(n.bandwidth_mbps, 2), label: "Mbps"},
+    {color: "#8b949e", value: ago(n.last_seen_s), label: "last seen"},
+  ]);
+}
+
+function applyFocus() {
+  for (const [id, e] of Object.entries(T.el)) {
+    const dim = state.focus && state.focus !== id ? .25 : 1;
+    e.g.style.opacity = dim; e.link.style.opacity = dim;
+  }
+  for (const b of document.querySelectorAll("#legend button")) b.style.opacity = state.focus && state.focus !== b.dataset.id ? .5 : 1;
+  renderCharts();
+}
+
+// packets: probes (4 per collector cycle, some dropped per packet_loss), event, ACK back
+function spawnPackets(events) {
+  const ids = new Set(events.map(e => e.event_id));
+  if (T.seen === null) { T.seen = ids; return; }                 // first load: don't replay history
+  const fresh = events.filter(e => !T.seen.has(e.event_id)).reverse();   // oldest first
+  T.seen = ids;
+  if (REDUCED || !fresh.length) return;
+  const per = {};
+  for (const ev of fresh) (per[ev.server_id] ||= []).push(ev);
+  const now = performance.now();
+  for (const [id, list] of Object.entries(per)) {
+    if (!T.pos.has(id)) continue;
+    const replayed = list.filter(e => e.received_at - Date.parse(e.timestamp) / 1000 > 30).length;
+    if (replayed && T.el[id]) flash(id, `↻ ${replayed} buffered event${replayed > 1 ? "s" : ""} replayed`);
+    list.slice(-12).forEach((ev, k, arr) => {
+      const start = now + (arr.length > 1 ? k * (2600 / arr.length) : Math.random() * 1800);
+      const dur = 1000 + Math.min(ev.latency_ms, 800) * 1.6;
+      for (let p = 0; p < 4; p++) addPacket({kind: "probe", id, start: start + p * 110, dur, drop: Math.random() * 100 < ev.packet_loss});
+      addPacket({kind: "event", id, start: start + 480, dur, color: colorOf(id)});
+    });
+  }
+}
+function addPacket(p) {
+  p.el = svg("circle", {r: p.kind === "event" ? 5.5 : p.kind === "ack" ? 3.5 : 2.6, opacity: 0,
+    fill: p.kind === "event" ? p.color : p.kind === "ack" ? "#0ca30c" : "#8b949e",
+    stroke: p.kind === "event" ? "#161b22" : "none", "stroke-width": 2}, T.gPk);
+  p.dropAt = .35 + Math.random() * .3;
+  T.packets.push(p);
+}
+function flash(id, msg) {
+  const f = T.el[id].flash; f.textContent = msg; f.setAttribute("opacity", 1);
+  clearTimeout(f._t); f._t = setTimeout(() => f.setAttribute("opacity", 0), 3500);
+}
+function ripple() {
+  if (T.ripples.childNodes.length > 5) return;
+  const c = svg("rect", {x: T.CX - T.HW, y: T.CY - T.HH, width: T.HW * 2, height: T.HH * 2, rx: 12, fill: "none", stroke: "#0ca30c", "stroke-width": 2}, T.ripples);
+  const t0 = performance.now();
+  (function grow(now) {
+    const k = (now - t0) / 800; if (k >= 1) { c.remove(); return; }
+    const g = 14 * k; c.setAttribute("x", T.CX - T.HW - g); c.setAttribute("y", T.CY - T.HH - g);
+    c.setAttribute("width", T.HW * 2 + 2 * g); c.setAttribute("height", T.HH * 2 + 2 * g); c.setAttribute("opacity", .7 * (1 - k));
+    requestAnimationFrame(grow);
+  })(t0);
+}
+function frame(now) {
+  T.packets = T.packets.filter(p => {
+    const pos = T.pos.get(p.id);
+    if (!pos) { p.el.remove(); return false; }
+    if (now < p.start) return true;
+    const [nx, ny] = nodeEdge(pos), [hx, hy] = hubEdge(pos.x, pos.y);
+    const [ax, ay, bx, by] = p.kind === "ack" ? [hx, hy, nx, ny] : [nx, ny, hx, hy];
+    let k = (now - p.start) / p.dur;
+    if (p.kind === "probe" && p.drop && k >= p.dropAt) {
+      if (!p.dropped) {
+        p.dropped = now; const x = ax + (bx - ax) * p.dropAt, y = ay + (by - ay) * p.dropAt;
+        p.el.setAttribute("fill", "#d03b3b"); p.el.setAttribute("cx", x); p.el.setAttribute("cy", y);
+        p.x = text(T.gPk, {x: x + 6, y: y - 5, fill: "#d03b3b", "font-size": 13, "font-weight": 700}, "✕");
+      }
+      const f = (now - p.dropped) / 900;
+      if (f >= 1) { p.el.remove(); p.x.remove(); return false; }
+      p.el.setAttribute("opacity", 1 - f); p.x.setAttribute("opacity", 1 - f);
+      return true;
+    }
+    if (k >= 1) {
+      p.el.remove();
+      if (p.kind === "event") { ripple(); addPacket({kind: "ack", id: p.id, start: now, dur: 650}); }
+      return false;
+    }
+    p.el.setAttribute("cx", ax + (bx - ax) * k); p.el.setAttribute("cy", ay + (by - ay) * k);
+    p.el.setAttribute("opacity", Math.min(1, k * 6));
+    return true;
+  });
+  requestAnimationFrame(frame);
+}
+
+// ==========================================================================================
+// Fleet telemetry small multiples (one metric per chart, one line per server, one y-axis)
+// ==========================================================================================
+const METRICS = [
+  {i: 1, title: "CPU usage", unit: "% · per server", max: 100, fmt: v => num(v) + "%"},
+  {i: 2, title: "Memory usage", unit: "% · per server", max: 100, fmt: v => num(v) + "%"},
+  {i: 4, title: "Latency to SaaS", unit: "ms · TCP handshake", floor: 10, fmt: v => (v < 10 ? num(v, 2) : num(v, 0)) + " ms"},
+  {i: 5, title: "Packet loss", unit: "% · failed probes", floor: 5, cap: 100, fmt: v => num(v) + "%"},
+  {i: 3, title: "Bandwidth", unit: "Mbps · rx + tx", floor: 1, fmt: v => num(v, 2) + " Mbps"},
+  {i: 8, title: "Ingest rate", unit: "events / min · 30 s rolling, by capture time (gaps = outage, refilled on replay)", floor: 5, partial: true, fmt: v => num(v) + " / min"},
+];
+const charts = METRICS.map(m => {
+  const card = document.createElement("div"); card.className = "chart";
+  const h = document.createElement("h3"); h.textContent = m.title;
+  const sm = document.createElement("small"); sm.textContent = m.unit; h.appendChild(sm);
+  const plot = document.createElement("div"); plot.className = "plot";
+  card.append(h, plot); $("charts").appendChild(card);
+  const s = svg("svg", {tabindex: 0, role: "img", "aria-label": `${m.title} over time for every server`}, plot);
+  return {m, plot, s};
+});
+const M = {l: 44, r: 112, t: 10, b: 24}, CH = 196;
+
+function niceStep(range, count) {
+  const raw = range / count, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p;
+}
+const tickFmt = v => Number(v.toFixed(2)).toLocaleString();
+function timeLabel(t, secs) {
+  const d = new Date(t * 1000), p = n => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}` + (secs ? `:${p(d.getSeconds())}` : "");
+}
+function visibleSeries() {
+  if (!state.ts) return [];
+  return Object.entries(state.ts.series).filter(([id]) => !state.hidden.has(id));
+}
+function allTimes() {
+  const set = new Set(); for (const [, pts] of visibleSeries()) for (const p of pts) set.add(p[0]);
+  return [...set].sort((a, b) => a - b);
+}
+
+function smoothRate(ts) {               // 30 s rolling rate: removes aliasing between collector interval and bucket size
+  const k = Math.max(1, Math.round(30 / ts.bucket_s));
+  for (const pts of Object.values(ts.series)) {
+    if (!pts.length) continue;
+    const first = pts[0][7], cnt = new Map(pts.map(p => [p[7], p[6] * ts.bucket_s / 60]));
+    for (const p of pts) {
+      const span = Math.min(k, p[7] - first + 1);
+      let sum = 0; for (let j = 0; j < span; j++) sum += cnt.get(p[7] - j) || 0;
+      p[8] = Math.round(sum / (span * ts.bucket_s) * 600) / 10;
+    }
+  }
+  return ts;
+}
+
+function renderCharts() {
+  if (!state.ts) return;
+  const vis = visibleSeries(), t1 = state.ts.now, tw = t1 - state.ts.window_s;
+  let first = Infinity; for (const [, pts] of vis) for (const p of pts) if (p[0] >= tw) first = Math.min(first, p[0]);
+  const t0 = Number.isFinite(first) ? Math.max(tw, Math.min(first, t1 - 60)) : tw;   // fit to data, >= 60 s span
+  const gap = Math.max(state.ts.bucket_s * 3, 20);
+  for (const c of charts) {
+    c.cross = null;
+    const w = Math.max(320, c.plot.clientWidth), pw = w - M.l - M.r, ph = CH - M.t - M.b;
+    c.s.replaceChildren(); c.s.setAttribute("width", w); c.s.setAttribute("height", CH); c.s.setAttribute("viewBox", `0 0 ${w} ${CH}`);
+    let hi = 0; for (const [, pts] of vis) for (const p of pts) if (p[0] >= t0 && p[c.m.i] > hi) hi = p[c.m.i];
+    const step = niceStep(c.m.max || Math.max(c.m.floor, hi * 1.15), 4);
+    const ymax = c.m.max || Math.min(c.m.cap || Infinity, Math.max(step, Math.ceil(Math.max(c.m.floor, hi * 1.15) / step) * step));
+    const X = t => M.l + (t - t0) / (t1 - t0) * pw, Y = v => M.t + (1 - Math.min(v, ymax) / ymax) * ph;
+    c.X = X; c.Y = Y; c.t0 = t0; c.t1 = t1; c.pw = pw;
+    for (let v = 0; v <= ymax + 1e-9; v += step) {           // hairline grid + y ticks
+      svg("line", {x1: M.l, x2: M.l + pw, y1: Y(v), y2: Y(v), stroke: v === 0 ? "#3d444d" : "#21262d", "stroke-width": 1}, c.s);
+      text(c.s, {x: M.l - 6, y: Y(v) + 4, "text-anchor": "end", "font-size": 11, fill: "#8b949e", style: "font-variant-numeric:tabular-nums"}, tickFmt(v));
+    }
+    const maxTicks = Math.max(2, Math.floor(pw / 90));
+    const xs = [15, 30, 60, 120, 300, 600, 900, 1800].find(s => (t1 - t0) / s <= maxTicks) || 1800;
+    for (let t = Math.ceil(t0 / xs) * xs; t <= t1; t += xs)
+      text(c.s, {x: X(t), y: CH - 6, "text-anchor": "middle", "font-size": 11, fill: "#8b949e", style: "font-variant-numeric:tabular-nums"}, timeLabel(t, xs < 60));
+    if (!vis.some(([, pts]) => pts.length)) {
+      text(c.s, {x: M.l + pw / 2, y: M.t + ph / 2, "text-anchor": "middle", "font-size": 12, fill: "#8b949e"}, "No telemetry in this range yet");
+      continue;
+    }
+    const ends = [];
+    const curBucket = Math.floor(t1 / state.ts.bucket_s);
+    for (const [id, all] of vis) {
+      const pts = c.m.partial ? all.filter(p => p[7] < curBucket) : all;
+      if (!pts.length) continue;
+      let d = "", prev = null;
+      for (const p of pts) {
+        if (p[0] < t0) continue;
+        d += (prev === null || p[0] - prev > gap ? "M" : "L") + X(p[0]).toFixed(1) + " " + Y(p[c.m.i]).toFixed(1);
+        prev = p[0];
+      }
+      const op = state.focus && state.focus !== id ? .18 : 1;
+      svg("path", {d, fill: "none", stroke: colorOf(id), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round", opacity: op}, c.s);
+      const last = pts[pts.length - 1];
+      if (last[0] >= t0) {
+        svg("circle", {cx: X(last[0]), cy: Y(last[c.m.i]), r: 4, fill: colorOf(id), stroke: "#161b22", "stroke-width": 2, opacity: op}, c.s);
+        ends.push({id, x: X(last[0]), y: Y(last[c.m.i]), op});
+      }
+    }
+    if (vis.length <= 4) {                                  // selective direct labels: only ends that stand alone
+      const srt = ends.sort((a, b) => a.y - b.y);
+      srt.forEach((e, i) => {
+        if ((i > 0 && e.y - srt[i - 1].y < 13) || (i < srt.length - 1 && srt[i + 1].y - e.y < 13)) return;
+        text(c.s, {x: Math.min(e.x + 9, w - M.r + 10), y: e.y + 4, "font-size": 11, fill: "#c9d1d9", opacity: e.op}, e.id);
+      });
+    }
+    c.cross = svg("g", {"pointer-events": "none"}, c.s);
+    const ov = svg("rect", {x: M.l, y: M.t, width: pw, height: ph, fill: "transparent"}, c.s);
+    ov.addEventListener("pointermove", ev => hoverAt(c, ev.clientX - c.s.getBoundingClientRect().left, ev));
+    ov.addEventListener("pointerleave", () => { state.hoverT = null; drawCross(); hideTip(); });
+    c.s.onkeydown = ev => keyNav(c, ev);
+    c.s.onblur = () => { state.hoverT = null; drawCross(); hideTip(); };
+  }
+  drawCross();
+}
+
+function hoverAt(c, px, ev) {
+  const times = allTimes(); if (!times.length) return;
+  const t = c.t0 + (px - M.l) / c.pw * (c.t1 - c.t0);
+  state.hoverT = times.reduce((a, b) => Math.abs(b - t) < Math.abs(a - t) ? b : a);
+  drawCross(); chartTip(c, ev.clientX, ev.clientY);
+}
+function keyNav(c, ev) {
+  if (!["ArrowLeft", "ArrowRight"].includes(ev.key)) return;
+  ev.preventDefault();
+  const times = allTimes(); if (!times.length) return;
+  let i = state.hoverT === null ? times.length - 1 : times.indexOf(state.hoverT) + (ev.key === "ArrowRight" ? 1 : -1);
+  state.hoverT = times[Math.max(0, Math.min(times.length - 1, i))];
+  drawCross();
+  const r = c.s.getBoundingClientRect(); chartTip(c, r.left + c.X(state.hoverT), r.top + 40);
+}
+function valuesAt(t, mi) {
+  const tol = Math.max(state.ts.bucket_s * 1.5, 8), out = [];
+  for (const [id, pts] of visibleSeries()) {
+    let best = null; for (const p of pts) if (Math.abs(p[0] - t) <= tol && (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t))) best = p;
+    if (best) out.push({id, p: best, v: best[mi]});
+  }
+  return out;
+}
+function drawCross() {                                       // shared crosshair across every chart
+  for (const c of charts) {
+    if (!c.cross) continue;
+    c.cross.replaceChildren();
+    if (state.hoverT === null) continue;
+    const x = c.X(state.hoverT);
+    svg("line", {x1: x, x2: x, y1: M.t, y2: CH - M.b, stroke: "#8b949e", "stroke-width": 1}, c.cross);
+    for (const r of valuesAt(state.hoverT, c.m.i))
+      svg("circle", {cx: c.X(r.p[0]), cy: c.Y(r.v), r: 4, fill: colorOf(r.id), stroke: "#161b22", "stroke-width": 2}, c.cross);
+  }
+}
+function chartTip(c, x, y) {
+  const rows = valuesAt(state.hoverT, c.m.i).sort((a, b) => b.v - a.v)
+    .map(r => ({color: colorOf(r.id), value: c.m.fmt(r.v), label: r.id}));
+  showTip(x, y, `${c.m.title} · ${timeLabel(state.hoverT, true)}`, rows);
+}
+
+function renderLegend(ids) {
+  const box = $("legend");
+  const have = [...box.querySelectorAll("button")].map(b => b.dataset.id).join("|");
+  if (have === ids.join("|")) {
+    for (const b of box.querySelectorAll("button")) b.setAttribute("aria-pressed", String(!state.hidden.has(b.dataset.id)));
+    return;
+  }
+  box.replaceChildren();
+  for (const id of ids) {
+    const b = document.createElement("button"); b.dataset.id = id;
+    b.setAttribute("aria-pressed", String(!state.hidden.has(id)));
+    const k = document.createElement("i"); k.className = "lk"; k.style.background = colorOf(id);
+    b.append(k, document.createTextNode(id));
+    b.onclick = () => { state.hidden.has(id) ? state.hidden.delete(id) : state.hidden.add(id); renderLegend(ids); renderCharts(); };
+    b.onpointerenter = () => { state.focus = id; applyFocus(); };
+    b.onpointerleave = () => { state.focus = null; applyFocus(); };
+    box.appendChild(b);
+  }
+}
+for (const b of document.querySelectorAll("#range button")) b.onclick = () => {
+  state.rangeMin = +b.dataset.m;
+  for (const x of document.querySelectorAll("#range button")) x.setAttribute("aria-pressed", String(x === b));
+  for (const c of charts) c.s.style.opacity = .5;           // hold the frame while refetching
+  tick();
+};
+let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderCharts, 120); });
+
+// ==========================================================================================
+// Feed, cards, tables
+// ==========================================================================================
 function renderFeed(recs) {
   $("feedcount").textContent = recs.length ? `${recs.length} item(s)` : "";
-  if (!recs.length) { $("feed").innerHTML = '<div class="ok">✓ All systems nominal — no correlated anomalies detected.</div>'; return; }
+  if (!recs.length) { $("feed").innerHTML = '<div class="ok"><i>✓</i>All systems nominal — no correlated anomalies detected.</div>'; return; }
   $("feed").innerHTML = recs.map(r => {
     const [finding, action] = r.message.split(" Recommended Action: ");
-    return `<div class="rec ${esc(r.severity)}">${esc(finding)}${action ? ` <span class="act">Recommended Action: ${esc(action)}</span>` : ""}`
+    return `<div class="rec ${esc(r.severity)}">${esc(finding)}${action ? ` <span class="act"><b>Recommended Action:</b> ${esc(action)}</span>` : ""}`
          + `<div class="meta">${esc(r.severity.toUpperCase())} · rule=${esc(r.rule)} · ${esc(r.generated_at)}</div></div>`;
   }).join("");
 }
-
 function renderFleet(nodes) {
   if (!nodes.length) return;
   $("fleet").innerHTML = nodes.map(n => `<tr>
-    <td class="mono">${esc(n.server_id)}</td><td>${badge(n.status)}</td>
-    <td>${bar(n.cpu_usage, 75, 90)}</td><td>${bar(n.memory_usage, 80, 92)}</td>
+    <td class="mono"><span class="key" style="background:${colorOf(n.server_id)}"></span>${esc(n.server_id)}</td><td>${badge(n.status)}</td>
+    <td>${meter(n.cpu_usage, 75, 90)}</td><td>${meter(n.memory_usage, 80, 92)}</td>
     <td>${num(n.bandwidth_mbps, 2)} Mbps</td>
     <td>${num(n.latency_ms)} ms <span class="muted">(${n.baseline_latency_ms === null ? "learning" : num(n.baseline_latency_ms)})</span></td>
-    <td style="color:${color(n.packet_loss, 0.01, 2)}">${num(n.packet_loss)}%</td>
-    <td class="${n.status === "OFFLINE" ? "v-red" : "muted"}">${ago(n.last_seen_s)}</td><td>${esc(n.events_window)}</td></tr>`).join("");
+    <td>${n.packet_loss >= 2 ? '<b style="color:var(--critical)">▲</b> ' : ""}${num(n.packet_loss)}%</td>
+    <td class="muted">${ago(n.last_seen_s)}</td><td>${esc(n.events_window)}</td></tr>`).join("");
 }
-
 function renderEvents(evs) {
   if (!evs.length) return;
   $("events").innerHTML = evs.map(e => `<tr>
     <td class="mono">${esc(String(e.timestamp).replace("T", " ").replace("Z", ""))}</td>
-    <td class="mono muted">${esc(String(e.event_id).slice(0, 8))}…</td><td class="mono">${esc(e.server_id)}</td>
+    <td class="mono muted">${esc(String(e.event_id).slice(0, 8))}…</td>
+    <td class="mono"><span class="key" style="background:${colorOf(e.server_id)}"></span>${esc(e.server_id)}</td>
     <td>${num(e.cpu_usage)}</td><td>${num(e.memory_usage)}</td><td>${num(e.bandwidth_mbps, 2)}</td>
     <td>${num(e.latency_ms)}</td><td>${num(e.packet_loss)}</td><td>${badge(e.health)}</td></tr>`).join("");
 }
+function setCard(id, value, bad) { const el = $(id); el.textContent = value; if (bad !== undefined) el.dataset.s = bad ? "bad" : "ok"; }
 
+const getJSON = url => fetch(url, {cache: "no-store"}).then(r => { if (!r.ok) throw r.status; return r.json(); });
+let busy = false;
 async function tick() {
+  if (busy) return; busy = true;
   try {
-    const [ins, evs] = await Promise.all([
-      fetch("/insights", {cache: "no-store"}).then(r => { if (!r.ok) throw r.status; return r.json(); }),
-      fetch("/events?limit=25", {cache: "no-store"}).then(r => { if (!r.ok) throw r.status; return r.json(); })]);
+    const [ins, evs, ts] = await Promise.all([getJSON("/insights"), getJSON("/events?limit=100"),
+                                              getJSON(`/timeseries?minutes=${state.rangeMin}`)]);
     const c = ins.counters;
-    $("c-total").textContent = c.total_events.toLocaleString();
-    $("c-rate").textContent = c.events_last_min;
-    $("c-online").textContent = `${c.nodes_online}/${c.nodes_total}`;
-    $("c-offline").textContent = c.nodes_offline; $("c-offline").className = "value " + (c.nodes_offline ? "v-red" : "v-green");
-    $("c-alerts").textContent = c.alerts_active; $("c-alerts").className = "value " + (c.alerts_active ? "v-red" : "v-green");
-    $("c-dups").textContent = c.duplicates_blocked;
-    renderFeed(ins.recommendations); renderFleet(ins.nodes); renderEvents(evs);
+    assign([...ins.nodes.map(n => n.server_id), ...Object.keys(ts.series)]);
+    setCard("c-total", c.total_events.toLocaleString()); setCard("c-rate", c.events_last_min);
+    setCard("c-online", `${c.nodes_online}/${c.nodes_total}`, c.nodes_online < c.nodes_total);
+    setCard("c-offline", c.nodes_offline, c.nodes_offline > 0); setCard("c-alerts", c.alerts_active, c.alerts_active > 0);
+    setCard("c-dups", c.duplicates_blocked);
+    state.nodes = ins.nodes; state.ts = smoothRate(ts);
+    renderFeed(ins.recommendations); renderFleet(ins.nodes); renderEvents(evs.slice(0, 25));
+    updateTopo(ins.nodes, c); spawnPackets(evs);
+    renderLegend([...new Set([...ins.nodes.map(n => n.server_id), ...Object.keys(ts.series)])].sort((a, b) => [...slots.keys()].indexOf(a) - [...slots.keys()].indexOf(b)));
+    for (const ch of charts) ch.s.style.opacity = 1;
+    renderCharts();
     $("dot").className = "dot"; $("live").textContent = "live";
     $("updated").textContent = new Date().toLocaleTimeString();
   } catch (e) { $("dot").className = "dot down"; $("live").textContent = "SaaS unreachable — retrying"; }
+  finally { busy = false; }
 }
 tick(); setInterval(tick, 3000);
 </script></body></html>"""
