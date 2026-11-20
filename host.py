@@ -21,6 +21,8 @@ import os
 import re
 import sqlite3
 import statistics
+import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -29,7 +31,9 @@ from flask import Flask, Response, g, jsonify, request
 # --------------------------------------------------------------------------- #
 # Configuration (12-factor: everything overridable through the environment)
 # --------------------------------------------------------------------------- #
-DB_PATH = os.environ.get("DB_PATH", "received.db")
+ON_AZURE = bool(os.environ.get("WEBSITE_SITE_NAME"))          # set by Azure App Service
+# SQLite WAL needs a local filesystem. Azure's /home is a network (SMB) share, so default to local /tmp there.
+DB_PATH = os.environ.get("DB_PATH") or ("/tmp/received.db" if ON_AZURE else "received.db")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "demo-secret-123")
 OFFLINE_AFTER_S = int(os.environ.get("OFFLINE_AFTER_S", "60"))   # stale-data cut-off
 FLEET_WINDOW_S = int(os.environ.get("FLEET_WINDOW_S", "3600"))   # forget nodes silent for longer
@@ -126,7 +130,23 @@ def _close_db(_exc):
         db.close()
 
 
-JOURNAL_MODE = init_db()   # runs at import so gunicorn workers are ready
+def _init_db_with_fallback() -> str:
+    """Never let a bad DB_PATH crash the container: fall back to the local temp dir."""
+    global DB_PATH
+    try:
+        return init_db()
+    except (sqlite3.Error, OSError) as exc:
+        fallback = os.path.join(tempfile.gettempdir(), "received.db")
+        if os.path.abspath(DB_PATH) == fallback:
+            raise
+        print(f"[smart-observability] DB_PATH={DB_PATH} unusable ({exc}); falling back to {fallback}",
+              file=sys.stderr, flush=True)
+        DB_PATH = fallback
+        return init_db()
+
+
+JOURNAL_MODE = _init_db_with_fallback()   # runs at import so gunicorn workers are ready
+print(f"[smart-observability] ready | db={DB_PATH} journal_mode={JOURNAL_MODE} azure={ON_AZURE}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -618,6 +638,6 @@ tick(); setInterval(tick, 3000);
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    print(f"[smart-observability] Tier-2 SaaS on 0.0.0.0:{port} | db={DB_PATH} journal_mode={JOURNAL_MODE}")
+    port = int(os.environ.get("PORT") or ("8000" if ON_AZURE else "5000"))   # Azure probes 8000 by default
+    print(f"[smart-observability] Tier-2 SaaS on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)
