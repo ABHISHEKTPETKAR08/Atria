@@ -375,9 +375,18 @@ def node_rules(sid: str, hist: list[dict], base_lat: float | None, base_bw: floa
                 out.append(_rec("warning", sid, f"sustained_{key}",
                                 f"Sustained {name} breach for {len(window)} consecutive samples "
                                 f"(latest {_f(e[key])}).", action))
+    ref, kind = _availability(e)
     for r in out:
-        r["trigger_ts"] = e["ts_epoch"]
+        r["trigger_ts"], r["trigger_kind"] = ref, kind
     return out
+
+
+def _availability(e: dict) -> tuple[float, str]:
+    """When could the SaaS first have known about this sample? Live data: its capture time.
+    Late data (store-and-forward replay, or a node clock running behind): its arrival time."""
+    if e["received_at"] - e["ts_epoch"] > REPLAY_DELAY_S:
+        return e["received_at"], "late sample arrived"
+    return e["ts_epoch"], "triggering sample captured"
 
 
 def analyze(now: float | None = None) -> dict:
@@ -400,14 +409,25 @@ def analyze(now: float | None = None) -> dict:
         (now - 120, REPLAY_DELAY_S))}
 
     # Real-time measurement from timestamps: capture (event timestamp) -> received by the SaaS.
-    delays: dict[str, list[float]] = {}
-    replayed_5m = 0
-    for r in db.execute("SELECT server_id, received_at - ts_epoch AS d FROM events WHERE received_at >= ?",
-                        (now - 300,)):
-        if r["d"] > REPLAY_DELAY_S:
-            replayed_5m += 1           # store-and-forward replays are reported separately, not as live latency
-        else:
+    delays: dict[str, list[float]] = {}           # live capture -> receive delays per node
+    all_d: dict[str, list[float]] = {}
+    burst: dict[str, int] = {}                    # late events received in the last 10 s (replay in progress)
+    for r in db.execute("SELECT server_id, received_at, received_at - ts_epoch AS d FROM events "
+                        "WHERE received_at >= ?", (now - 300,)):
+        all_d.setdefault(r["server_id"], []).append(r["d"])
+        if r["d"] <= REPLAY_DELAY_S:
             delays.setdefault(r["server_id"], []).append(r["d"])
+        elif r["received_at"] >= now - 10:
+            burst[r["server_id"]] = burst.get(r["server_id"], 0) + 1
+    # A node whose every recent event is late by a near-constant amount has a clock running behind -
+    # that is skew, not a replay. A replay is a burst with widely spread delays.
+    skew: dict[str, float] = {}
+    for sid, ds in all_d.items():
+        if len(ds) >= 6 and min(ds) > REPLAY_DELAY_S and max(ds) - min(ds) < 30:
+            skew[sid] = -round(statistics.median(ds), 1)          # negative = node clock behind the SaaS
+        elif delays.get(sid) and statistics.median(delays[sid]) < -1.0:
+            skew[sid] = -round(statistics.median(delays[sid]), 1)   # positive = node clock ahead
+    replayed_5m = sum(1 for sid, ds in all_d.items() if sid not in skew for d in ds if d > REPLAY_DELAY_S)
     latest_ts: dict[str, float] = {}
 
     nodes, recs, degraded, online = [], [], [], 0
@@ -429,13 +449,17 @@ def analyze(now: float | None = None) -> dict:
                              "Verify the collector process and the node's network path to the SaaS; "
                              "the collector buffer will replay missed events on reconnect.", label="OUTAGE",
                              trigger_ts=stats[sid]["last_rx"]))
+            recs[-1]["trigger_kind"] = "last telemetry"
         else:
             online += 1
-            recs.extend(node_rules(sid, hist, base_lat, base_bw))
+            if burst.get(sid, 0) >= 3 and sid not in skew:
+                pass        # replay in progress: the newest live sample is still in flight; avoid stale alerts
+            else:
+                recs.extend(node_rules(sid, hist, base_lat, base_bw))
             if latest["packet_loss"] >= T["loss_poor"] or _lat_jump(
                     latest["latency_ms"], base_lat, T["lat_jump_ratio"], T["lat_jump_min_ms"]):
                 degraded.append(sid)
-        if sid in replays:
+        if sid in replays and sid not in skew:
             rp = replays[sid]
             recs.append(_rec("info", sid, "store_and_forward_replay",
                              f"Reconnected - {rp['n']} buffered events replayed with original UTC timestamps "
@@ -452,7 +476,7 @@ def analyze(now: float | None = None) -> dict:
             "events_window": stats[sid]["n"],
             "ingest_delay_s": round(statistics.median(delays[sid]), 2) if delays.get(sid) else None,
         })
-        latest_ts[sid] = latest["ts_epoch"]
+        latest_ts[sid] = _availability(latest)[0]
 
     if len(degraded) >= 2 and len(degraded) / online > T["fleet_ratio"]:   # strict majority
         recs.append(_rec("critical", None, "fleet_network_degradation",
@@ -460,6 +484,7 @@ def analyze(now: float | None = None) -> dict:
                          f"({', '.join(degraded[:6])}) - common upstream cause.",
                          "Investigate the shared path (central SaaS ingress, core switch, ISP/gateway) "
                          "before touching individual nodes.", trigger_ts=max(latest_ts[d] for d in degraded)))
+        recs[-1]["trigger_kind"] = "latest degraded sample available"
 
     track_alerts(db, recs, now)
     recs.sort(key=lambda r: SEVERITY_RANK[r["severity"]])
@@ -478,7 +503,7 @@ def analyze(now: float | None = None) -> dict:
         "targets": SLO_TARGETS, "offline_after_s": OFFLINE_AFTER_S, "eval_interval_s": EVAL_INTERVAL_S,
         "ingest_p50_s": _pct(live, 50), "ingest_p95_s": _pct(live, 95), "ingest_samples": len(live),
         "replayed_5m": replayed_5m,
-        "skew_nodes": sorted(sid for sid, v in delays.items() if statistics.median(v) < -1.0),
+        "clock_skew": [{"server_id": sid, "offset_s": off} for sid, off in sorted(skew.items())],
         "alert_p50_s": _pct(alert_d, 50), "alert_p95_s": _pct(alert_d, 95),
         "alert_max_s": round(max(alert_d), 2) if alert_d else None, "alert_samples": len(alert_d),
         "offline_last_s": round(offline_d[-1], 1) if offline_d else None,
@@ -835,7 +860,7 @@ const ago = s => s < 60 ? `${Math.round(s)}s ago` : `${Math.floor(s / 60)}m ${Ma
 const svg = (tag, attrs = {}, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
 const text = (parent, attrs, str) => { const t = svg("text", attrs, parent); t.textContent = str; return t; };
 
-const state = {nodes: [], ts: null, rangeMin: 15, hidden: new Set(), focus: null, hoverT: null};
+const state = {nodes: [], ts: null, rangeMin: 15, hidden: new Set(), focus: null, hoverT: null, skewed: new Set()};
 
 // ---- tooltip (DOM-built: names are untrusted, use textContent) ---------------------------
 const tip = $("tip");
@@ -974,7 +999,7 @@ function spawnPackets(events) {
   for (const [id, list] of Object.entries(per)) {
     if (!T.pos.has(id)) continue;
     const replayed = list.filter(e => e.received_at - Date.parse(e.timestamp) / 1000 > 30).length;
-    if (replayed && T.el[id]) flash(id, `↻ ${replayed} buffered event${replayed > 1 ? "s" : ""} replayed`);
+    if (replayed && T.el[id] && !state.skewed.has(id)) flash(id, `↻ ${replayed} buffered event${replayed > 1 ? "s" : ""} replayed`);
     list.slice(-12).forEach((ev, k, arr) => {
       const start = now + (arr.length > 1 ? k * (2600 / arr.length) : Math.random() * 1800);
       const dur = 1000 + Math.min(ev.latency_ms, 800) * 1.6;
@@ -1230,7 +1255,7 @@ function renderFeed(recs) {
     const [finding, action] = r.message.split(" Recommended Action: ");
     return `<div class="rec ${esc(r.severity)}">${esc(finding)}${action ? ` <span class="act"><b>Recommended Action:</b> ${esc(action)}</span>` : ""}`
          + `<div class="meta">${esc(r.severity.toUpperCase())} · rule=${esc(r.rule)}`
-         + (r.detected_after_s !== undefined ? ` · <b>detected ${num(r.detected_after_s)} s</b> after ${r.rule === "outage" ? "last telemetry" : "triggering sample captured"} ${esc(r.trigger_at)}` : "")
+         + (r.detected_after_s !== undefined ? ` · <b>detected ${num(r.detected_after_s)} s</b> after ${esc(r.trigger_kind || "trigger")} ${esc(r.trigger_at)}` : "")
          + ` · ${esc(r.generated_at)}</div></div>`;
   }).join("");
 }
@@ -1292,7 +1317,11 @@ function renderSLO(slo, c) {
   $("s-zero-sub").textContent = `${slo.replayed_5m} buffered events replayed with original timestamps (5 min) · event_id idempotency`;
   $("c-offline-l").textContent = `Offline nodes (>${slo.offline_after_s}s silent)`;
   const sk = $("s-skew");
-  if (slo.skew_nodes.length) { sk.style.display = ""; sk.innerHTML = `<b>▲</b> Clock skew: ${esc(slo.skew_nodes.join(", "))} report capture times ahead of the SaaS clock — sync NTP (<span class="mono">sudo timedatectl set-ntp true</span>) for accurate latency.`; }
+  if (slo.clock_skew.length) {
+    sk.style.display = "";
+    sk.innerHTML = `<b>▲</b> Clock skew: ` + slo.clock_skew.map(k => `${esc(k.server_id)} is ${num(Math.abs(k.offset_s), 0)} s ${k.offset_s < 0 ? "behind" : "ahead of"} the SaaS clock`).join("; ")
+      + ` — alerts are timed from data arrival for these nodes; sync NTP (<span class="mono">sudo timedatectl set-ntp true</span>) for accurate capture latency.`;
+  }
   else sk.style.display = "none";
 }
 function setCard(id, value, bad) { const el = $(id); el.textContent = value; if (bad !== undefined) el.dataset.s = bad ? "bad" : "ok"; }
@@ -1312,6 +1341,7 @@ async function tick() {
     setCard("c-offline", c.nodes_offline, c.nodes_offline > 0); setCard("c-alerts", c.alerts_active, c.alerts_active > 0);
     setCard("c-dups", c.duplicates_blocked);
     state.nodes = ins.nodes; state.ts = smoothRate(ts);
+    state.skewed = new Set(ins.slo.clock_skew.map(k => k.server_id));
     renderSLO(ins.slo, c); renderFeed(ins.recommendations); renderFleet(ins.nodes); renderEvents(evs.slice(0, 25));
     updateTopo(ins.nodes, c); spawnPackets(evs);
     renderLegend([...new Set([...ins.nodes.map(n => n.server_id), ...Object.keys(ts.series)])].sort((a, b) => [...slots.keys()].indexOf(a) - [...slots.keys()].indexOf(b)));
