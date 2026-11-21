@@ -23,9 +23,12 @@ Only `requests` is required; `psutil` is used when installed (recommended on Win
 from __future__ import annotations
 
 import argparse
+import collections
+import csv
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -35,6 +38,7 @@ import statistics
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -483,6 +487,12 @@ class DiskBuffer:
             print(f"[collector] WARNING buffer cap {MAX_BUFFER} reached; dropped {dropped} oldest", file=sys.stderr)
         self.save()
 
+    def extend(self, events: list[dict]) -> None:
+        for e in events[:-1]:
+            self.events.append(e)
+        if events:
+            self.append(events[-1])                  # single save (and cap check) for the whole batch
+
     def drop_front(self, n: int) -> None:
         if n:
             self.events = self.events[n:]
@@ -574,7 +584,7 @@ def _paint(text: str, style: str, spans, hl: str, reset: str) -> str:
 
 
 def render_panel(st: Style, cycle: int, url: str, raw: list[str], scrubbed: list[str], counts: dict,
-                 event: dict, wire: bytes, leaks: dict) -> None:
+                 events: list[dict], wires: list[bytes], leaks: dict, source: str = "local system log") -> None:
     width = max(90, min(shutil.get_terminal_size((160, 40)).columns, 220))
     col = (width - 3) // 2
 
@@ -584,15 +594,24 @@ def render_panel(st: Style, cycle: int, url: str, raw: list[str], scrubbed: list
                                                   break_on_hyphens=False) or [""]):
                 yield (bullet if j == 0 else "  ") + seg
 
-    left = [(f"RAW LOG  (local only - NEVER transmitted)", st.B + st.R), ("─" * col, st.D)]
+    left = [(f"RAW {source.upper()}  (local only - NEVER transmitted)"[:col], st.B + st.R), ("─" * col, st.D)]
     left += [(ln, "") for ln in wrapped(raw)]
-    right = [("SANITIZED PAYLOAD  (exact JSON leaving this node)", st.B + st.G), ("─" * col, st.D)]
-    right += [(seg, st.G) for line in json.dumps(event, indent=2, sort_keys=True).splitlines()
-              for seg in textwrap.wrap(line, col, drop_whitespace=False) or [""]]
+    head = "SANITIZED PAYLOAD" if len(events) == 1 else f"SANITIZED PAYLOADS  ({len(events)} events, one per host)"
+    right = [(f"{head}  (exact JSON leaving this node)"[:col], st.B + st.G), ("─" * col, st.D)]
+    if len(events) == 1:
+        right += [(seg, st.G) for line in json.dumps(events[0], indent=2, sort_keys=True).splitlines()
+                  for seg in textwrap.wrap(line, col, drop_whitespace=False) or [""]]
+    elif not events:
+        right += [("(no metric records in this window - nothing sent)", st.D)]
+    else:
+        for w in wires[:5]:
+            right += [(seg, st.G) for seg in textwrap.wrap(w.decode("utf-8"), col, break_long_words=True) or [""]]
+        if len(wires) > 5:
+            right += [(f"… +{len(wires) - 5} more events (same schema, all in the wire total below)", st.D)]
     right += [("", ""), ("scrubbed log (kept on node, not sent):", st.D)]
     right += [(ln, st.D) for ln in wrapped(scrubbed, "  ")]
 
-    title = f" EGRESS PROOF · cycle {cycle} · {event['timestamp']} · -> {url} "
+    title = f" EGRESS PROOF · cycle {cycle} · {utc_now_iso()} · -> {url} "
     print("\n" + st.C + st.B + title.center(width, "═") + st.X)
     for (lt, ls), (rt, rs) in zip_longest(left, right, fillvalue=("", "")):
         lpad, rpad = lt.ljust(col)[:col], rt.ljust(col)[:col]
@@ -603,8 +622,304 @@ def render_panel(st: Style, cycle: int, url: str, raw: list[str], scrubbed: list
     dlp = (f"{st.OK} PASS {st.X} 0 secret patterns in egress bytes" if not leaks
            else f"{st.HL} FAIL {st.X} {leaks} -> EVENT BLOCKED")
     print(f"{st.D}{'─' * width}{st.X}")
+    blob = b"\n".join(wires)
     print(f"Redactions: {st.Y}{red}{st.X}  |  DLP egress gate: {dlp}  |  "
-          f"wire {len(wire)} B sha256:{hashlib.sha256(wire).hexdigest()[:16]}…")
+          f"wire {len(blob)} B in {len(wires)} event(s) sha256:{hashlib.sha256(blob).hexdigest()[:16]}…")
+
+
+# --------------------------------------------------------------------------- #
+# 6. Organiser telemetry stream adapter (shared stream -> per-host, allow-listed metadata)
+# --------------------------------------------------------------------------- #
+def _nk(key) -> str:
+    """Normalised field name: 'CPU_Usage', 'cpu.usage', 'cpuUsage' -> 'cpuusage'."""
+    return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+
+_ALIASES = {   # tried in order; matched case/punctuation-insensitively; override any with --map
+    "server_id": ["server_id", "host", "hostname", "host.name", "node", "node_name", "server", "server_name",
+                  "device", "device_id", "instance", "instance_id", "machine", "agent.name", "source_host"],
+    "tenant": ["tenant", "tenant_id", "org", "org_id", "organization", "customer", "account", "team"],
+    "timestamp": ["timestamp", "@timestamp", "ts", "time", "datetime", "event_time", "date", "created_at"],
+    "cpu_usage": ["cpu_usage", "cpu", "cpu_pct", "cpu_percent", "cpu_util", "cpu_utilization", "cpu.usage",
+                  "cpu.pct", "cpu_load", "system.cpu.total.pct"],
+    "memory_usage": ["memory_usage", "mem", "memory", "mem_pct", "mem_percent", "memory_pct", "memory_percent",
+                     "mem_usage", "ram", "ram_usage", "ram_pct", "memory.used.pct", "system.memory.used.pct"],
+    "bandwidth_mbps": ["bandwidth_mbps", "bandwidth", "bw", "bw_mbps", "net_mbps", "network_mbps", "throughput",
+                       "throughput_mbps", "traffic_mbps"],
+    "latency_ms": ["latency_ms", "latency", "rtt", "rtt_ms", "ping", "ping_ms", "delay_ms", "delay",
+                   "response_time_ms", "response_time"],
+    "packet_loss": ["packet_loss", "loss", "packetloss", "loss_pct", "loss_percent", "packet_loss_pct",
+                    "pkt_loss", "drop_rate", "drops_pct"],
+    "message": ["message", "msg", "log", "raw", "line", "text", "event", "body"],
+}
+ALIASES = {k: [_nk(a) for a in v] for k, v in _ALIASES.items()}
+STREAM_METRICS = ("cpu_usage", "memory_usage", "bandwidth_mbps", "latency_ms", "packet_loss")
+METRIC_CLAMP = {"cpu_usage": 100.0, "memory_usage": 100.0, "packet_loss": 100.0,
+                "latency_ms": 600_000.0, "bandwidth_mbps": 1_000_000.0}
+KV_RE = re.compile(r"""([A-Za-z_@][\w.@-]*)\s*[=:]\s*("[^"]*"|'[^']*'|[^\s,;]+)""")
+
+
+def _flatten(obj: dict, prefix: str = "") -> dict:
+    out = {}
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            out.update(_flatten(v, f"{prefix}{k}."))
+        elif not isinstance(v, (list, tuple)):
+            out[f"{prefix}{k}"] = v
+    return out
+
+
+def _num(v) -> float | None:
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if math.isfinite(v) else None
+    m = re.match(r"\s*(-?\d+(?:\.\d+)?)", str(v))          # tolerates units: "93%", "120ms", "1.5 Mbps"
+    return float(m.group(1)) if m else None
+
+
+def _ts(v) -> float | None:
+    if isinstance(v, (int, float)) or (isinstance(v, str) and re.fullmatch(r"\s*\d{9,}(\.\d+)?\s*", v)):
+        n = float(v)
+        n = n / 1000 if n > 1e12 else n                        # epoch milliseconds
+        return n if n > 1e9 else None
+    try:
+        dt = datetime.fromisoformat(str(v).strip().replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def normalize_record(rec: dict, mapping: dict) -> dict:
+    by = {}
+    for k, v in rec.items():
+        by.setdefault(_nk(k), (k, v))
+    out = {"metrics": {}, "host": None, "tenant": None, "ts": None}
+    for field, cands in ALIASES.items():
+        for alias in ([mapping[field]] if field in mapping else cands):
+            if alias not in by:
+                continue
+            key, val = by[alias]
+            if field in STREAM_METRICS:
+                x = _num(val)
+                if x is None:
+                    continue
+                if field in ("cpu_usage", "memory_usage", "packet_loss") and 0 <= x <= 1 and \
+                        re.search(r"ratio|fraction|\.pct$", str(key).lower()):
+                    x *= 100                                    # fractional percentages (e.g. metricbeat .pct)
+                out["metrics"][field] = min(max(x, 0.0), METRIC_CLAMP[field])
+            elif field == "timestamp":
+                out["ts"] = _ts(val)
+            elif field in ("server_id", "tenant") and str(val).strip():
+                out["host" if field == "server_id" else "tenant"] = str(val).strip()
+            break
+    return out
+
+
+class StreamSource:
+    """Reads the shared organiser telemetry stream and turns it into one allow-listed event per host per cycle.
+
+    Sources : a file (tailed, rotation-safe) · '-'/'stdin' (pipe in nc, curl -N, kcat, mosquitto_sub ...)
+              · an http(s):// URL polled every cycle (JSON list/object or JSON lines; de-duplicated).
+    Formats : JSON / JSON lines / arrays, SSE 'data:' lines, 'topic {json}' (MQTT -v), CSV with header,
+              key=value pairs, plain log lines (kept local: shown in the proof panel, never sent).
+    """
+
+    def __init__(self, spec: str, mapping: dict, default_host: str, from_start: bool = False,
+                 headers: dict | None = None):
+        self.spec, self.mapping, self.default_host = spec, mapping, default_host
+        self.q: collections.deque = collections.deque(maxlen=200_000)
+        self.csv_header: list[str] | None = None
+        self.lines = self.records = self.metric_records = 0
+        self.hosts: set[str] = set()
+        self.missing_reported: set[str] = set()
+        self.notes: list[str] = []
+        self.ts_fallback_noted = False
+        self.eof = False
+        if spec in ("-", "stdin"):
+            self.kind = "stdin"
+            threading.Thread(target=self._read_stdin, daemon=True).start()
+        elif spec.startswith(("http://", "https://")):
+            self.kind, self.http = "http", requests.Session()   # separate session: never send our SaaS token
+            self.http.headers.update(headers or {})
+            self.seen: collections.deque = collections.deque(maxlen=20_000)
+            self.seen_set: set = set()
+        else:
+            self.kind, self.path = "file", spec[5:] if spec.startswith("file:") else spec
+            threading.Thread(target=self._tail, args=(from_start,), daemon=True).start()
+
+    def describe(self) -> str:
+        if self.kind == "stdin":
+            return "stdin (piped stream)"
+        return f"polling {self.spec}" if self.kind == "http" else f"tailing {self.path}"
+
+    # readers -------------------------------------------------------------
+    def _read_stdin(self) -> None:
+        for line in sys.stdin:
+            self.q.append(line)
+        self.eof = True
+
+    def _tail(self, from_start: bool) -> None:
+        fh, ino, partial = None, None, ""
+        while True:
+            try:
+                if fh is None:
+                    fh = open(self.path, "r", encoding="utf-8", errors="replace")
+                    ino = os.fstat(fh.fileno()).st_ino
+                    if not from_start:
+                        fh.seek(0, os.SEEK_END)
+                    from_start = True                 # a rotated-in file is read from its start
+                line = fh.readline()
+                if line:
+                    if line.endswith("\n"):
+                        self.q.append(partial + line)
+                        partial = ""
+                    else:
+                        partial += line
+                    continue
+                time.sleep(0.2)
+                st = os.stat(self.path)
+                if st.st_ino != ino or st.st_size < fh.tell():
+                    fh.close()
+                    fh = None
+            except OSError:
+                if fh:
+                    fh.close()
+                fh = None
+                time.sleep(1)
+
+    def _poll(self) -> None:
+        try:
+            r = self.http.get(self.spec, timeout=(5, 10))
+            r.raise_for_status()
+        except requests.RequestException as exc:
+            self.notes.append(f"stream poll failed: {type(exc).__name__}")
+            return
+        try:
+            body = r.json()
+            items = body if isinstance(body, list) else next(
+                (body[k] for k in ("records", "data", "items", "events", "metrics", "results")
+                 if isinstance(body, dict) and isinstance(body.get(k), list)), [body])
+            lines = [json.dumps(i, sort_keys=True) for i in items]
+        except ValueError:
+            lines = r.text.splitlines()
+        ts_keys = set(ALIASES["timestamp"])
+        for line in lines:
+            try:                                      # only timestamped records can be repeats; a snapshot
+                rec = json.loads(line)                # endpoint without timestamps is fresh on every poll
+                stamped = isinstance(rec, dict) and any(_nk(k) in ts_keys for k in _flatten(rec))
+            except ValueError:
+                stamped = False
+            if not stamped:
+                self.q.append(line)
+                continue
+            if line in self.seen_set:                 # repeated timestamped record: already ingested
+                continue
+            if len(self.seen) == self.seen.maxlen:
+                self.seen_set.discard(self.seen[0])
+            self.seen.append(line)
+            self.seen_set.add(line)
+            self.q.append(line)
+
+    # parsing -------------------------------------------------------------
+    def _parse(self, line: str) -> list[dict]:
+        s = line.strip()
+        if s.startswith("data:"):                     # server-sent events
+            s = s[5:].strip()
+        if not s.startswith(("{", "[")) and "{" in s and s.endswith("}"):
+            s = s[s.index("{"):]                      # 'topic {json}' (mosquitto_sub -v)
+        if s.startswith(("{", "[")):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, dict):
+                    return [_flatten(obj)]
+                if isinstance(obj, list):
+                    return [_flatten(o) for o in obj if isinstance(o, dict)]
+            except ValueError:
+                pass
+        if "," in s:
+            cells = next(csv.reader([s]))
+            known = {a for v in ALIASES.values() for a in v}
+            if self.csv_header is None and len(cells) >= 3 and \
+                    all(re.fullmatch(r"[A-Za-z_@][\w .@-]*", c.strip()) for c in cells) and \
+                    sum(_nk(c) in known for c in cells) >= 2:
+                self.csv_header = [c.strip() for c in cells]
+                return []
+            if self.csv_header and len(cells) == len(self.csv_header):
+                return [dict(zip(self.csv_header, (c.strip() for c in cells)))]
+        kv = {k: v.strip("\"'") for k, v in KV_RE.findall(s)}
+        return [kv] if kv else []
+
+    # aggregation ---------------------------------------------------------
+    def collect(self) -> tuple[list[dict], list[str]]:
+        if self.kind == "http":
+            self._poll()
+        lines = []
+        while self.q:
+            lines.append(self.q.popleft())
+        now = time.time()
+        groups: dict[str, dict] = {}
+        raw: list[str] = []
+        for line in lines:
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            self.lines += 1
+            raw.append(line)
+            for rec in self._parse(line):
+                self.records += 1
+                n = normalize_record(rec, self.mapping)
+                if not n["metrics"]:
+                    continue                          # log-only record: stays on this node
+                self.metric_records += 1
+                host = n["host"] or self.default_host
+                sid = re.sub(r"[^A-Za-z0-9._:-]", "-", f"{n['tenant']}:{host}" if n["tenant"] else host)[:64]
+                g = groups.setdefault(sid, {"vals": {m: [] for m in STREAM_METRICS}, "ts": []})
+                for m, x in n["metrics"].items():
+                    g["vals"][m].append(x)
+                g["ts"].append(n["ts"] or now)
+        events = []
+        for sid, g in groups.items():
+            self.hosts.add(sid)
+            vals = {}
+            for m in STREAM_METRICS:
+                xs = g["vals"][m]
+                if not xs and m not in self.missing_reported:
+                    self.missing_reported.add(m)
+                    self.notes.append(f"stream has no field for {m} (sent as 0) - map one with --map {m}=<field>")
+                vals[m] = (max(xs) if m == "packet_loss" else sum(xs) / len(xs)) if xs else 0.0
+            ts = max(g["ts"])
+            if abs(ts - now) > 300:                   # recorded dataset or skewed source clock
+                if not self.ts_fallback_noted:
+                    self.ts_fallback_noted = True
+                    self.notes.append(f"stream timestamps are {ts - now:+.0f}s from this clock - "
+                                      "using receive time for real-time measurement")
+                ts = now
+            events.append({
+                "event_id": uuid.uuid4().hex, "server_id": sid,
+                "cpu_usage": round(vals["cpu_usage"], 1), "memory_usage": round(vals["memory_usage"], 1),
+                "bandwidth_mbps": round(vals["bandwidth_mbps"], 3), "latency_ms": round(vals["latency_ms"], 2),
+                "packet_loss": round(vals["packet_loss"], 1),
+                "health": local_health(vals["cpu_usage"], vals["memory_usage"], vals["latency_ms"],
+                                       vals["packet_loss"]),
+                "timestamp": datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds")
+                                     .replace("+00:00", "Z"),
+            })
+        return sorted(events, key=lambda e: e["server_id"]), raw
+
+    def pop_notes(self) -> list[str]:
+        notes, self.notes = self.notes, []
+        return notes
+
+
+def parse_map(spec: str | None) -> dict:
+    mapping = {}
+    for part in filter(None, (spec or "").split(",")):
+        field, _, src = part.partition("=")
+        if field.strip() not in ALIASES or not src.strip():
+            sys.exit(f"--map: use <field>=<stream field>, field one of {sorted(ALIASES)}")
+        mapping[field.strip()] = _nk(src)
+    return mapping
 
 
 # --------------------------------------------------------------------------- #
@@ -663,6 +978,13 @@ def parse_args():
     ap.add_argument("--chaos-after", type=int, default=4, help="cycles of normal data before chaos starts")
     ap.add_argument("--probe", choices=["auto", "tcp", "http"], default="auto",
                     help="latency/loss method: tcp handshakes, https round trips, or auto (default)")
+    ap.add_argument("--source", default="local",
+                    help="telemetry source: 'local' (this PC, default) or the organiser stream: a file path, "
+                         "'-' for stdin (pipe nc / curl -N / kcat / mosquitto_sub), or an http(s):// URL to poll")
+    ap.add_argument("--map", help="field mapping for the stream, e.g. 'cpu_usage=cpu.pct,server_id=hostname'")
+    ap.add_argument("--from-start", action="store_true", help="file source: read from the beginning, not the end")
+    ap.add_argument("--source-header", action="append", default=[],
+                    help="HTTP header for a URL source, e.g. 'Authorization: Bearer abc' (repeatable)")
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit")
     ap.add_argument("--no-color", action="store_true")
     return ap.parse_args()
@@ -682,14 +1004,25 @@ def main() -> int:
     p = urlparse(url)
     host, port = p.hostname, p.port or (443 if p.scheme == "https" else 80)
     server_id = args.server_id or detect_server_id(host, port)
-    sampler, logs = MetricsSampler(), LogSource(args.log_file, args.demo)
     shipper = Shipper(url, args.token, args.buffer)
-    prober = Prober(url, shipper.session, args.probe)
+    stream = None
+    if args.source != "local":
+        headers = dict(h.split(":", 1) for h in args.source_header if ":" in h)
+        stream = StreamSource(args.source, parse_map(args.map), args.server_id or "stream-node",
+                              args.from_start, {k.strip(): v.strip() for k, v in headers.items()})
+    else:
+        sampler, logs = MetricsSampler(), LogSource(args.log_file, args.demo)
+        prober = Prober(url, shipper.session, args.probe)
 
     print(f"{st.B}Smart Observability · Tier-1 Edge Collector{st.X}")
-    print(f"  node       : {server_id}\n  target     : {url}\n  log source : {logs.describe()}")
-    print(f"  probe      : {prober.describe()}")
-    print(f"  metrics    : {'psutil' if psutil else 'stdlib (/proc or Win32)'}\n  buffer     : "
+    if stream:
+        print(f"  source     : organiser stream - {stream.describe()} (format auto-detected)")
+        print(f"  nodes      : one per host in the stream (tenant:host when a tenant field exists)")
+        print(f"  target     : {url}\n  window     : {args.interval:g}s aggregation per host")
+    else:
+        print(f"  node       : {server_id}\n  target     : {url}\n  log source : {logs.describe()}")
+        print(f"  probe      : {prober.describe()}")
+    print(f"  metrics    : {'from stream fields' if stream else ('psutil' if psutil else 'stdlib (/proc or Win32)')}\n  buffer     : "
           f"{os.path.abspath(args.buffer)} ({len(shipper.buffer)} pending from previous run)")
     if args.chaos:
         print(f"  {st.Y}CHAOS MODE '{args.chaos}' after cycle {args.chaos_after}: metrics synthetically perturbed{st.X}")
@@ -699,32 +1032,42 @@ def main() -> int:
         while True:
             cycle += 1
             started = time.monotonic()
-            cpu, mem, bw = sampler.sample()
-            lat, loss = prober.measure()
-            measured_loss = loss
-            if args.chaos and cycle > args.chaos_after:
-                cpu, mem, bw, lat, loss = apply_chaos(args.chaos, cpu, mem, bw, lat, loss)
-
-            event = {   # allow-listed, numeric-only metadata
-                "event_id": uuid.uuid4().hex, "server_id": server_id,   # event_id = idempotency key fixed at capture
-                "cpu_usage": round(cpu, 1), "memory_usage": round(mem, 1), "bandwidth_mbps": round(bw, 3),
-                "latency_ms": round(lat, 2), "packet_loss": round(loss, 1),
-                "health": local_health(cpu, mem, lat, loss), "timestamp": utc_now_iso(),
-            }
-            raw = logs.read(args.log_lines)
+            if stream:
+                events, raw = stream.collect()
+                raw = raw[-max(args.log_lines * 2, 6):]   # proof panel shows the newest raw stream lines
+                if args.demo:
+                    raw += random.sample(DEMO_LOG_LINES, 2)
+                for note in stream.pop_notes():
+                    print(f"{st.Y}! {note}{st.X}")
+            else:
+                cpu, mem, bw = sampler.sample()
+                lat, loss = prober.measure()
+                measured_loss = loss
+                if args.chaos and cycle > args.chaos_after:
+                    cpu, mem, bw, lat, loss = apply_chaos(args.chaos, cpu, mem, bw, lat, loss)
+                events = [{   # allow-listed, numeric-only metadata; event_id = idempotency key fixed at capture
+                    "event_id": uuid.uuid4().hex, "server_id": server_id,
+                    "cpu_usage": round(cpu, 1), "memory_usage": round(mem, 1), "bandwidth_mbps": round(bw, 3),
+                    "latency_ms": round(lat, 2), "packet_loss": round(loss, 1),
+                    "health": local_health(cpu, mem, lat, loss), "timestamp": utc_now_iso(),
+                }]
+                raw = logs.read(args.log_lines)
             scrubbed, counts = [], {}
             for line in raw:
                 clean, c = scrub(line)
                 scrubbed.append(clean)
                 for k, v in c.items():
                     counts[k] = counts.get(k, 0) + v
-            wire = wire_bytes(event)
-            _, leaks = scrub(wire.decode("utf-8"))      # DLP gate on the exact egress bytes
-            render_panel(st, cycle, url, raw, scrubbed, counts, event, wire, leaks)
+            wires = [wire_bytes(e) for e in events]
+            _, leaks = scrub(b"\n".join(wires).decode("utf-8"))      # DLP gate on the exact egress bytes
+            render_panel(st, cycle, url, raw, scrubbed, counts, events, wires, leaks,
+                         "organiser stream" if stream else "system log")
             if leaks:
-                print(f"{st.R}✖ egress blocked by DLP gate - event discarded{st.X}")
+                print(f"{st.R}✖ egress blocked by DLP gate - {len(events)} event(s) discarded{st.X}")
+            elif not events and not len(shipper.buffer):
+                print(f"{st.D}· no metric records this window{' (stream ended)' if stream and stream.eof else ''}{st.X}")
             else:
-                shipper.buffer.append(event)           # write-ahead: persisted before any network I/O
+                shipper.buffer.extend(events)          # write-ahead: persisted before any network I/O
                 res = shipper.flush()
                 sent = res["delivered"] + res["duplicates"]
                 if res["error"]:
@@ -738,11 +1081,16 @@ def main() -> int:
                               f"idempotency){st.X}")
                     was_offline = False
                     srv = (res["last"] or {})
-                    print(f"{st.G}✔ delivered -> {srv.get('status', 'ok')} (server health={srv.get('health', '?')})"
-                          f" | buffer: {res['remaining']} pending{st.X}")
-                note = prober.observe(measured_loss, not res["error"] and sent > 0)
-                if note:
-                    print(f"{st.Y}! {note}{st.X}")
+                    if stream:
+                        print(f"{st.G}✔ delivered {sent} event(s) for {len(events)} host(s) this window "
+                              f"| hosts seen: {len(stream.hosts)} | buffer: {res['remaining']} pending{st.X}")
+                    else:
+                        print(f"{st.G}✔ delivered -> {srv.get('status', 'ok')} (server health={srv.get('health', '?')})"
+                              f" | buffer: {res['remaining']} pending{st.X}")
+                if not stream:
+                    note = prober.observe(measured_loss, not res["error"] and sent > 0)
+                    if note:
+                        print(f"{st.Y}! {note}{st.X}")
                 if res["deadlettered"]:
                     print(f"{st.Y}! {res['deadlettered']} event(s) rejected by schema -> {DEADLETTER_FILE}{st.X}")
             if args.once:

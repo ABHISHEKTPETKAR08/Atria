@@ -23,6 +23,7 @@ import sqlite3
 import statistics
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -35,7 +36,9 @@ ON_AZURE = bool(os.environ.get("WEBSITE_SITE_NAME"))          # set by Azure App
 # SQLite WAL needs a local filesystem. Azure's /home is a network (SMB) share, so default to local /tmp there.
 DB_PATH = os.environ.get("DB_PATH") or ("/tmp/received.db" if ON_AZURE else "received.db")
 INGEST_TOKEN = os.environ.get("INGEST_TOKEN", "demo-secret-123")
-OFFLINE_AFTER_S = int(os.environ.get("OFFLINE_AFTER_S", "60"))   # stale-data cut-off
+OFFLINE_AFTER_S = int(os.environ.get("OFFLINE_AFTER_S", "30"))   # stale-data cut-off (6 missed 5 s cycles)
+EVAL_INTERVAL_S = 2.0         # background AIOps evaluation period (alerts don't wait for a viewer)
+SLO_TARGETS = {"dashboard_s": 10, "alert_s": 15, "offline_s": 60}   # hackathon real-time targets
 FLEET_WINDOW_S = int(os.environ.get("FLEET_WINDOW_S", "3600"))   # forget nodes silent for longer
 HISTORY_DEPTH = 60            # samples per node for the adaptive baseline (~5 min at 5 s)
 REPLAY_DELAY_S = 30           # received_at - timestamp above this => store-and-forward replay
@@ -95,6 +98,17 @@ CREATE INDEX IF NOT EXISTS idx_events_node_ts  ON events(server_id, ts_epoch DES
 CREATE INDEX IF NOT EXISTS idx_events_received ON events(received_at DESC);
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0);
 INSERT OR IGNORE INTO counters(name, value) VALUES ('duplicates_blocked', 0);
+CREATE TABLE IF NOT EXISTS alerts (           -- alert lifecycle, for measured detection latency
+    key         TEXT PRIMARY KEY,             -- rule|server_id
+    rule        TEXT NOT NULL,
+    server_id   TEXT,
+    severity    TEXT NOT NULL,
+    trigger_ts  REAL NOT NULL,                -- capture time of the sample that triggered it (outage: last rx)
+    first_seen  REAL NOT NULL,                -- server time the engine first raised it
+    last_seen   REAL NOT NULL,
+    resolved_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_first ON alerts(first_seen DESC);
 """
 
 
@@ -268,11 +282,46 @@ def classify(ev: dict, base_lat: float | None = None) -> str:
 SEVERITY_RANK = {"critical": 0, "warning": 1, "info": 2}
 
 
-def _rec(severity: str, node: str | None, rule: str, finding: str, action: str, label: str | None = None) -> dict:
+def _rec(severity: str, node: str | None, rule: str, finding: str, action: str, label: str | None = None,
+         trigger_ts: float | None = None) -> dict:
     label = label or {"critical": "ALERT", "warning": "WARN", "info": "INFO"}[severity]
     scope = f"Node {node}" if node else "Fleet"
-    return {"severity": severity, "rule": rule, "server_id": node,
+    return {"severity": severity, "rule": rule, "server_id": node, "trigger_ts": trigger_ts,
             "message": f"{label} [{scope}]: {finding} Recommended Action: {action}"}
+
+
+def _pct(vals: list[float], q: float) -> float | None:
+    """Nearest-rank percentile."""
+    if not vals:
+        return None
+    srt = sorted(vals)
+    return round(srt[max(0, min(len(srt) - 1, math.ceil(q / 100 * len(srt)) - 1))], 2)
+
+
+def track_alerts(db: sqlite3.Connection, recs: list[dict], now: float) -> None:
+    """Persist alert lifecycle so detection latency (first raised - triggering sample's capture time)
+    is measured, not assumed. Info items (e.g. replay notices) are not alerts."""
+    active = {f"{r['rule']}|{r['server_id'] or '*'}": r for r in recs if r["severity"] != "info"}
+    with db:
+        open_rows = {row["key"]: row for row in db.execute("SELECT * FROM alerts WHERE resolved_at IS NULL")}
+        for key, r in active.items():
+            row = open_rows.get(key)
+            if row:
+                db.execute("UPDATE alerts SET last_seen = ? WHERE key = ?", (now, key))
+                r["first_seen"], r["trigger_ts"] = row["first_seen"], row["trigger_ts"]
+            else:
+                trig = r["trigger_ts"] if r["trigger_ts"] is not None else now
+                db.execute(
+                    "INSERT INTO alerts (key, rule, server_id, severity, trigger_ts, first_seen, last_seen, resolved_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(key) DO UPDATE SET severity = excluded.severity, "
+                    "trigger_ts = excluded.trigger_ts, first_seen = excluded.first_seen, last_seen = excluded.last_seen, "
+                    "resolved_at = NULL WHERE alerts.resolved_at IS NOT NULL",
+                    (key, r["rule"], r["server_id"], r["severity"], trig, now, now))
+                row = db.execute("SELECT first_seen, trigger_ts FROM alerts WHERE key = ?", (key,)).fetchone()
+                r["first_seen"], r["trigger_ts"] = row["first_seen"], row["trigger_ts"]
+            r["detected_after_s"] = round(r["first_seen"] - r["trigger_ts"], 1)
+        for key in open_rows.keys() - active.keys():
+            db.execute("UPDATE alerts SET resolved_at = ? WHERE key = ? AND resolved_at IS NULL", (now, key))
 
 
 def node_rules(sid: str, hist: list[dict], base_lat: float | None, base_bw: float | None) -> list[dict]:
@@ -326,6 +375,8 @@ def node_rules(sid: str, hist: list[dict], base_lat: float | None, base_bw: floa
                 out.append(_rec("warning", sid, f"sustained_{key}",
                                 f"Sustained {name} breach for {len(window)} consecutive samples "
                                 f"(latest {_f(e[key])}).", action))
+    for r in out:
+        r["trigger_ts"] = e["ts_epoch"]
     return out
 
 
@@ -348,6 +399,17 @@ def analyze(now: float | None = None) -> dict:
         "WHERE received_at >= ? AND received_at - ts_epoch > ? GROUP BY server_id",
         (now - 120, REPLAY_DELAY_S))}
 
+    # Real-time measurement from timestamps: capture (event timestamp) -> received by the SaaS.
+    delays: dict[str, list[float]] = {}
+    replayed_5m = 0
+    for r in db.execute("SELECT server_id, received_at - ts_epoch AS d FROM events WHERE received_at >= ?",
+                        (now - 300,)):
+        if r["d"] > REPLAY_DELAY_S:
+            replayed_5m += 1           # store-and-forward replays are reported separately, not as live latency
+        else:
+            delays.setdefault(r["server_id"], []).append(r["d"])
+    latest_ts: dict[str, float] = {}
+
     nodes, recs, degraded, online = [], [], [], 0
     for sid, hist in sorted(history.items()):
         latest, prev = hist[0], hist[1:]
@@ -365,7 +427,8 @@ def analyze(now: float | None = None) -> dict:
                              f"No telemetry for {age:.0f}s (threshold {OFFLINE_AFTER_S}s); last known health "
                              f"{health}, last sample {latest['timestamp']}.",
                              "Verify the collector process and the node's network path to the SaaS; "
-                             "the collector buffer will replay missed events on reconnect.", label="OUTAGE"))
+                             "the collector buffer will replay missed events on reconnect.", label="OUTAGE",
+                             trigger_ts=stats[sid]["last_rx"]))
         else:
             online += 1
             recs.extend(node_rules(sid, hist, base_lat, base_bw))
@@ -387,24 +450,48 @@ def analyze(now: float | None = None) -> dict:
             "packet_loss": latest["packet_loss"], "baseline_latency_ms": base_lat,
             "last_seen_s": round(age, 1), "last_timestamp": latest["timestamp"],
             "events_window": stats[sid]["n"],
+            "ingest_delay_s": round(statistics.median(delays[sid]), 2) if delays.get(sid) else None,
         })
+        latest_ts[sid] = latest["ts_epoch"]
 
     if len(degraded) >= 2 and len(degraded) / online > T["fleet_ratio"]:   # strict majority
         recs.append(_rec("critical", None, "fleet_network_degradation",
                          f"{len(degraded)}/{online} online nodes show simultaneous latency jump / packet loss "
                          f"({', '.join(degraded[:6])}) - common upstream cause.",
                          "Investigate the shared path (central SaaS ingress, core switch, ISP/gateway) "
-                         "before touching individual nodes."))
+                         "before touching individual nodes.", trigger_ts=max(latest_ts[d] for d in degraded)))
 
+    track_alerts(db, recs, now)
     recs.sort(key=lambda r: SEVERITY_RANK[r["severity"]])
     for r in recs:
         r["generated_at"] = _iso(datetime.fromtimestamp(now, timezone.utc))
+        r["trigger_at"] = _iso(datetime.fromtimestamp(r["trigger_ts"], timezone.utc)) if r["trigger_ts"] else None
+        r.pop("trigger_ts", None)
+        r.pop("first_seen", None)
+
+    live = [d for v in delays.values() for d in v]
+    hist_alerts = db.execute("SELECT rule, first_seen - trigger_ts AS d FROM alerts WHERE first_seen >= ?",
+                             (now - 3600,)).fetchall()
+    alert_d = [a["d"] for a in hist_alerts if a["rule"] != "outage"]
+    offline_d = [a["d"] for a in hist_alerts if a["rule"] == "outage"]
+    slo = {
+        "targets": SLO_TARGETS, "offline_after_s": OFFLINE_AFTER_S, "eval_interval_s": EVAL_INTERVAL_S,
+        "ingest_p50_s": _pct(live, 50), "ingest_p95_s": _pct(live, 95), "ingest_samples": len(live),
+        "replayed_5m": replayed_5m,
+        "skew_nodes": sorted(sid for sid, v in delays.items() if statistics.median(v) < -1.0),
+        "alert_p50_s": _pct(alert_d, 50), "alert_p95_s": _pct(alert_d, 95),
+        "alert_max_s": round(max(alert_d), 2) if alert_d else None, "alert_samples": len(alert_d),
+        "offline_last_s": round(offline_d[-1], 1) if offline_d else None,
+        "offline_max_s": round(max(offline_d), 1) if offline_d else None, "offline_samples": len(offline_d),
+    }
 
     total = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     last_min = db.execute("SELECT COUNT(*) FROM events WHERE received_at >= ?", (now - 60,)).fetchone()[0]
     dups = db.execute("SELECT value FROM counters WHERE name='duplicates_blocked'").fetchone()[0]
     return {
+        "now": now,
         "generated_at": _iso(datetime.fromtimestamp(now, timezone.utc)),
+        "slo": slo,
         "counters": {
             "total_events": total, "events_last_min": last_min, "duplicates_blocked": dups,
             "nodes_total": len(nodes), "nodes_online": online, "nodes_offline": len(nodes) - online,
@@ -414,6 +501,31 @@ def analyze(now: float | None = None) -> dict:
         "nodes": nodes,
         "thresholds": {"offline_after_s": OFFLINE_AFTER_S, **T},
     }
+
+
+_eval_lock = threading.Lock()
+_eval_started = False
+
+
+def _evaluator() -> None:
+    while True:
+        time.sleep(EVAL_INTERVAL_S)
+        try:
+            with app.app_context():
+                analyze()
+        except Exception as exc:   # keep evaluating; a transient DB error must not kill the loop
+            print(f"[smart-observability] evaluator error: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
+@app.before_request
+def _start_evaluator() -> None:
+    """One evaluator thread per worker process, started after fork (gunicorn-safe)."""
+    global _eval_started
+    if not _eval_started:
+        with _eval_lock:
+            if not _eval_started:
+                threading.Thread(target=_evaluator, name="aiops-evaluator", daemon=True).start()
+                _eval_started = True
 
 
 # --------------------------------------------------------------------------- #
@@ -604,6 +716,14 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 #tip .tr{display:flex;align-items:center;gap:8px;line-height:1.7}
 #tip .tr b{color:var(--text);font-variant-numeric:tabular-nums;min-width:64px}
 #tip .tr span{color:var(--muted)}
+.slo{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));margin:0 -1px -1px 0}
+.slo>div{padding:14px 16px;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+.slo .label{color:var(--muted);font-size:12px}
+.slo .value{font-size:24px;font-weight:600;margin-top:2px}
+.slo .verdict{display:inline-flex;align-items:center;gap:6px;font-size:12px;margin-top:2px;color:var(--text2)}
+.slo .verdict i{font-style:normal;font-weight:700}
+.slo .sub{color:var(--muted);font-size:11.5px;margin-top:2px}
+.skew{padding:8px 16px;border-top:1px solid var(--border);font-size:12px;color:var(--text2)}.skew b{color:var(--warning)}
 @media (prefers-reduced-motion:reduce){.dot{animation:none}}
 </style></head>
 <body><div class="wrap">
@@ -625,10 +745,22 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
   <div class="card"><div class="label">Total events ingested</div><div class="value" id="c-total">0</div></div>
   <div class="card"><div class="label">Ingest rate (events / min)</div><div class="value" id="c-rate">0</div></div>
   <div class="card"><div class="label">Active nodes</div><div class="value" id="c-online">0</div></div>
-  <div class="card"><div class="label">Offline nodes (&gt;60s silent)</div><div class="value" id="c-offline">0</div></div>
+  <div class="card"><div class="label" id="c-offline-l">Offline nodes</div><div class="value" id="c-offline">0</div></div>
   <div class="card"><div class="label">Active alerts</div><div class="value" id="c-alerts">0</div></div>
   <div class="card"><div class="label">Duplicates blocked (idempotency)</div><div class="value" id="c-dups">0</div></div>
 </div>
+
+<section>
+  <h2><span>⏱ Real-time SLOs · measured from event timestamps</span><span class="muted">capture time → SaaS receive → dashboard · alert raised · offline flagged</span></h2>
+  <div class="slo">
+    <div><div class="label">Capture → SaaS (p95)</div><div class="value" id="s-ingest">—</div><div class="sub" id="s-ingest-sub">waiting for events</div></div>
+    <div><div class="label">Capture → dashboard (p95)</div><div class="value" id="s-dash">—</div><div class="verdict" id="s-dash-v"></div><div class="sub" id="s-dash-sub">measured in this browser</div></div>
+    <div><div class="label">Alert detection (p95)</div><div class="value" id="s-alert">—</div><div class="verdict" id="s-alert-v"></div><div class="sub" id="s-alert-sub">no alerts yet</div></div>
+    <div><div class="label">Offline detection</div><div class="value" id="s-off">—</div><div class="verdict" id="s-off-v"></div><div class="sub" id="s-off-sub">no outages yet</div></div>
+    <div><div class="label">Zero loss · zero duplicates</div><div class="value" id="s-zero">—</div><div class="sub" id="s-zero-sub"></div></div>
+  </div>
+  <div class="skew" id="s-skew" style="display:none"></div>
+</section>
 
 <section>
   <h2><span>🛰 Live Packet Tracer · Edge servers → SaaS</span><span class="muted" id="topo-sub">each dot is a real event or probe</span></h2>
@@ -657,8 +789,8 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 <section>
   <h2><span>🖥 Node Fleet</span><span class="muted">health: Excellent · Good · Fair · Poor · OFFLINE</span></h2>
   <div class="scroll"><table>
-    <thead><tr><th>Node</th><th>Status</th><th>CPU</th><th>Memory</th><th>Bandwidth</th><th>Latency (baseline)</th><th>Packet loss</th><th>Last seen</th><th>Events (1h)</th></tr></thead>
-    <tbody id="fleet"><tr><td colspan="9" class="empty">No nodes reporting yet.</td></tr></tbody>
+    <thead><tr><th>Node</th><th>Status</th><th>CPU</th><th>Memory</th><th>Bandwidth</th><th>Latency (baseline)</th><th>Packet loss</th><th>Capture → SaaS</th><th>Last seen</th><th>Events (1h)</th></tr></thead>
+    <tbody id="fleet"><tr><td colspan="10" class="empty">No nodes reporting yet.</td></tr></tbody>
   </table></div>
 </section>
 
@@ -1097,7 +1229,9 @@ function renderFeed(recs) {
   $("feed").innerHTML = recs.map(r => {
     const [finding, action] = r.message.split(" Recommended Action: ");
     return `<div class="rec ${esc(r.severity)}">${esc(finding)}${action ? ` <span class="act"><b>Recommended Action:</b> ${esc(action)}</span>` : ""}`
-         + `<div class="meta">${esc(r.severity.toUpperCase())} · rule=${esc(r.rule)} · ${esc(r.generated_at)}</div></div>`;
+         + `<div class="meta">${esc(r.severity.toUpperCase())} · rule=${esc(r.rule)}`
+         + (r.detected_after_s !== undefined ? ` · <b>detected ${num(r.detected_after_s)} s</b> after ${r.rule === "outage" ? "last telemetry" : "triggering sample captured"} ${esc(r.trigger_at)}` : "")
+         + ` · ${esc(r.generated_at)}</div></div>`;
   }).join("");
 }
 function renderFleet(nodes) {
@@ -1108,6 +1242,7 @@ function renderFleet(nodes) {
     <td>${num(n.bandwidth_mbps, 2)} Mbps</td>
     <td>${num(n.latency_ms)} ms <span class="muted">(${n.baseline_latency_ms === null ? "learning" : num(n.baseline_latency_ms)})</span></td>
     <td>${n.packet_loss >= 2 ? '<b style="color:var(--critical)">▲</b> ' : ""}${num(n.packet_loss)}%</td>
+    <td>${n.ingest_delay_s === null ? '<span class="muted">—</span>' : num(n.ingest_delay_s, 2) + " s"}</td>
     <td class="muted">${ago(n.last_seen_s)}</td><td>${esc(n.events_window)}</td></tr>`).join("");
 }
 function renderEvents(evs) {
@@ -1119,6 +1254,47 @@ function renderEvents(evs) {
     <td>${num(e.cpu_usage)}</td><td>${num(e.memory_usage)}</td><td>${num(e.bandwidth_mbps, 2)}</td>
     <td>${num(e.latency_ms)}</td><td>${num(e.packet_loss)}</td><td>${badge(e.health)}</td></tr>`).join("");
 }
+const dashDelays = [];                    // capture -> first shown in this browser (server-clock corrected)
+let dashSeen = null;
+function pct(arr, q) { if (!arr.length) return null; const s = [...arr].sort((a, b) => a - b); return s[Math.max(0, Math.min(s.length - 1, Math.ceil(q / 100 * s.length) - 1))]; }
+function measureDashboard(evs, serverNow, clientAt) {
+  const ids = new Set(evs.map(e => e.event_id));
+  if (dashSeen === null) { dashSeen = ids; return; }
+  const offset = serverNow - clientAt;
+  for (const e of evs) {
+    if (dashSeen.has(e.event_id)) continue;
+    const cap = Date.parse(e.timestamp) / 1000;
+    if (e.received_at - cap > 30) continue;          // replayed backlog is not live latency
+    dashDelays.push(Date.now() / 1000 + offset - cap);
+  }
+  if (dashDelays.length > 400) dashDelays.splice(0, dashDelays.length - 400);
+  dashSeen = ids;
+}
+function verdict(id, value, target) {
+  const el = $(id);
+  if (value === null || value === undefined) { el.innerHTML = ""; return; }
+  const ok = value <= target;
+  el.innerHTML = `<i style="color:${ok ? "var(--good)" : "var(--critical)"}">${ok ? "✓" : "!"}</i>${ok ? "within" : "over"} target ≤ ${target} s`;
+}
+const secs = v => v === null || v === undefined ? "—" : (Math.abs(v) < 10 ? num(v, 2) : num(v, 1)) + " s";
+function renderSLO(slo, c) {
+  const t = slo.targets;
+  $("s-ingest").textContent = secs(slo.ingest_p95_s);
+  $("s-ingest-sub").textContent = slo.ingest_samples ? `p50 ${secs(slo.ingest_p50_s)} · ${slo.ingest_samples} live events, last 5 min` : "waiting for events";
+  const d95 = pct(dashDelays, 95);
+  $("s-dash").textContent = secs(d95); verdict("s-dash-v", d95, t.dashboard_s);
+  $("s-dash-sub").textContent = dashDelays.length ? `p50 ${secs(pct(dashDelays, 50))} · ${dashDelays.length} events seen live in this browser` : "measuring new events…";
+  $("s-alert").textContent = secs(slo.alert_p95_s); verdict("s-alert-v", slo.alert_p95_s, t.alert_s);
+  $("s-alert-sub").textContent = slo.alert_samples ? `sample capture → alert raised · max ${secs(slo.alert_max_s)} · ${slo.alert_samples} alert(s), last 60 min` : "no alerts yet (engine evaluates every " + slo.eval_interval_s + " s)";
+  $("s-off").textContent = secs(slo.offline_last_s); verdict("s-off-v", slo.offline_max_s, t.offline_s);
+  $("s-off-sub").textContent = slo.offline_samples ? `last telemetry → OFFLINE · worst ${secs(slo.offline_max_s)} · threshold ${slo.offline_after_s} s` : `none yet · flagged after ${slo.offline_after_s} s of silence`;
+  $("s-zero").textContent = `${c.duplicates_blocked} dup blocked`;
+  $("s-zero-sub").textContent = `${slo.replayed_5m} buffered events replayed with original timestamps (5 min) · event_id idempotency`;
+  $("c-offline-l").textContent = `Offline nodes (>${slo.offline_after_s}s silent)`;
+  const sk = $("s-skew");
+  if (slo.skew_nodes.length) { sk.style.display = ""; sk.innerHTML = `<b>▲</b> Clock skew: ${esc(slo.skew_nodes.join(", "))} report capture times ahead of the SaaS clock — sync NTP (<span class="mono">sudo timedatectl set-ntp true</span>) for accurate latency.`; }
+  else sk.style.display = "none";
+}
 function setCard(id, value, bad) { const el = $(id); el.textContent = value; if (bad !== undefined) el.dataset.s = bad ? "bad" : "ok"; }
 
 const getJSON = url => fetch(url, {cache: "no-store"}).then(r => { if (!r.ok) throw r.status; return r.json(); });
@@ -1128,6 +1304,7 @@ async function tick() {
   try {
     const [ins, evs, ts] = await Promise.all([getJSON("/insights"), getJSON("/events?limit=100"),
                                               getJSON(`/timeseries?minutes=${state.rangeMin}`)]);
+    measureDashboard(evs, ins.now, Date.now() / 1000);
     const c = ins.counters;
     assign([...ins.nodes.map(n => n.server_id), ...Object.keys(ts.series)]);
     setCard("c-total", c.total_events.toLocaleString()); setCard("c-rate", c.events_last_min);
@@ -1135,7 +1312,7 @@ async function tick() {
     setCard("c-offline", c.nodes_offline, c.nodes_offline > 0); setCard("c-alerts", c.alerts_active, c.alerts_active > 0);
     setCard("c-dups", c.duplicates_blocked);
     state.nodes = ins.nodes; state.ts = smoothRate(ts);
-    renderFeed(ins.recommendations); renderFleet(ins.nodes); renderEvents(evs.slice(0, 25));
+    renderSLO(ins.slo, c); renderFeed(ins.recommendations); renderFleet(ins.nodes); renderEvents(evs.slice(0, 25));
     updateTopo(ins.nodes, c); spawnPackets(evs);
     renderLegend([...new Set([...ins.nodes.map(n => n.server_id), ...Object.keys(ts.series)])].sort((a, b) => [...slots.keys()].indexOf(a) - [...slots.keys()].indexOf(b)));
     for (const ch of charts) ch.s.style.opacity = 1;
