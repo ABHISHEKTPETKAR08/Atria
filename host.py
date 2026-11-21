@@ -48,8 +48,10 @@ MAX_EVENT_AGE_DAYS = 30       # reject absurdly old timestamps
 ALLOWED_FIELDS = frozenset({
     "event_id", "server_id", "cpu_usage", "memory_usage", "bandwidth_mbps",
     "latency_ms", "packet_loss", "health", "timestamp",
+    "disk_usage", "failed_logins",          # optional: % of system disk used; failed logins counted on the node
 })
-REQUIRED_FIELDS = ALLOWED_FIELDS - {"health"}
+OPTIONAL_FIELDS = frozenset({"health", "disk_usage", "failed_logins"})
+REQUIRED_FIELDS = ALLOWED_FIELDS - OPTIONAL_FIELDS
 METRIC_BOUNDS = {
     "cpu_usage": (0.0, 100.0),
     "memory_usage": (0.0, 100.0),
@@ -71,6 +73,9 @@ T = {
     "lat_rise_ratio": 1.5, "lat_rise_min_ms": 30,     # softer rise, used with bandwidth surge
     "bw_spike_ratio": 3.0, "bw_spike_min": 20,        # Mbps
     "sustain_n": 3,                                   # consecutive samples for single-metric alerts
+    "disk_good": 80, "disk_fair": 90, "disk_crit": 95,
+    "disk_fill_min": 85, "disk_fill_eta_min": 30,     # predictive: >= 85 % and full within 30 min
+    "fail_burst_min": 10, "fail_burst_ratio": 5,      # failed logins per sample vs the node's own baseline
     "fleet_ratio": 0.5,                               # > this share of nodes degraded => common cause
 }
 
@@ -89,6 +94,8 @@ CREATE TABLE IF NOT EXISTS events (
     bandwidth_mbps REAL NOT NULL,
     latency_ms     REAL NOT NULL,
     packet_loss    REAL NOT NULL,
+    disk_usage     REAL,                      -- optional (NULL from older collectors)
+    failed_logins  INTEGER,                   -- optional: count only; log lines never leave the node
     health         TEXT,                      -- collector-reported (server recomputes its own)
     timestamp      TEXT NOT NULL,             -- original capture time, UTC ISO-8601
     ts_epoch       REAL NOT NULL,
@@ -125,6 +132,10 @@ def init_db() -> str:
     try:
         mode = conn.execute("PRAGMA journal_mode=WAL;").fetchone()[0]   # persistent per DB file
         conn.executescript(SCHEMA)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        for col, typ in (("disk_usage", "REAL"), ("failed_logins", "INTEGER")):   # migrate older databases
+            if col not in cols:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
         conn.commit()
         return mode
     finally:
@@ -233,6 +244,21 @@ def validate(payload) -> tuple[dict | None, str | None]:
             return None, f"{key} out of range [{lo:g}, {hi:g}]"
         ev[key] = float(val)
 
+    disk = payload.get("disk_usage")
+    if disk is not None:
+        if isinstance(disk, bool) or not isinstance(disk, (int, float)) or not math.isfinite(disk) \
+                or not 0 <= disk <= 100:
+            return None, "disk_usage must be a number in [0, 100]"
+        disk = float(disk)
+    ev["disk_usage"] = disk
+    fails = payload.get("failed_logins")
+    if fails is not None:
+        if isinstance(fails, bool) or not isinstance(fails, (int, float)) or not math.isfinite(fails) \
+                or fails != int(fails) or not 0 <= fails <= 1_000_000:
+            return None, "failed_logins must be a whole number in [0, 1000000]"
+        fails = int(fails)
+    ev["failed_logins"] = fails
+
     health = payload.get("health")
     if health is not None and health not in HEALTH_STATES:
         return None, f"health must be one of {list(HEALTH_STATES)}"
@@ -269,12 +295,15 @@ def _lat_jump(lat: float, base: float | None, ratio: float, min_ms: float) -> bo
 
 def classify(ev: dict, base_lat: float | None = None) -> str:
     cpu, mem, lat, loss = ev["cpu_usage"], ev["memory_usage"], ev["latency_ms"], ev["packet_loss"]
-    if loss >= T["loss_poor"] or cpu >= T["cpu_crit"] or mem >= T["mem_crit"] or lat >= T["lat_crit"]:
+    disk = ev.get("disk_usage")
+    disk = -1.0 if disk is None else disk
+    if loss >= T["loss_poor"] or cpu >= T["cpu_crit"] or mem >= T["mem_crit"] or lat >= T["lat_crit"] \
+            or disk >= T["disk_crit"]:
         return "Poor"        # critical breach or packet loss
     if (loss > 0 or cpu >= T["cpu_fair"] or mem >= T["mem_fair"] or lat >= T["lat_fair"]
-            or _lat_jump(lat, base_lat, T["lat_jump_ratio"], T["lat_jump_min_ms"])):
+            or disk >= T["disk_fair"] or _lat_jump(lat, base_lat, T["lat_jump_ratio"], T["lat_jump_min_ms"])):
         return "Fair"        # elevated baseline / latency
-    if cpu >= T["cpu_good"] or mem >= T["mem_good"] or lat >= T["lat_good"]:
+    if cpu >= T["cpu_good"] or mem >= T["mem_good"] or lat >= T["lat_good"] or disk >= T["disk_good"]:
         return "Good"        # minor load
     return "Excellent"       # all metrics optimal
 
@@ -375,10 +404,70 @@ def node_rules(sid: str, hist: list[dict], base_lat: float | None, base_bw: floa
                 out.append(_rec("warning", sid, f"sustained_{key}",
                                 f"Sustained {name} breach for {len(window)} consecutive samples "
                                 f"(latest {_f(e[key])}).", action))
+    out.extend(disk_rules(sid, hist))
+    out.extend(login_rules(sid, hist))
     ref, kind = _availability(e)
     for r in out:
         r["trigger_ts"], r["trigger_kind"] = ref, kind
     return out
+
+
+def disk_growth(hist: list[dict]) -> float | None:
+    """Disk growth in % per minute over the node's recent history (None if unknown / not growing)."""
+    newest = hist[0]["ts_epoch"]
+    pts = [(h["ts_epoch"], h["disk_usage"]) for h in hist
+           if h.get("disk_usage") is not None and h["ts_epoch"] >= newest - 180]   # last 3 minutes
+    if len(pts) < 4 or pts[0][0] - pts[-1][0] < 30:          # need >= 4 samples spanning >= 30 s
+        return None
+    mt = sum(t for t, _ in pts) / len(pts)
+    md = sum(d for _, d in pts) / len(pts)
+    var = sum((t - mt) ** 2 for t, _ in pts)
+    slope = sum((t - mt) * (d - md) for t, d in pts) / var * 60 if var else 0.0   # least squares, %/min
+    return slope if slope > 0.01 else None
+
+
+def disk_rules(sid: str, hist: list[dict]) -> list[dict]:
+    disk = hist[0].get("disk_usage")
+    if disk is None:
+        return []
+    rate = disk_growth(hist)
+    eta = (100 - disk) / rate if rate else None
+    when = None if eta is None else ("in under a minute" if eta < 1 else f"in about {eta:.0f} min")
+    window = [h.get("disk_usage") for h in hist[:T["sustain_n"]]]
+    if len(window) == T["sustain_n"] and all(d is not None and d >= T["disk_crit"] for d in window):
+        trend = f", still rising {_f(rate)}%/min - full {when}" if eta is not None else ""
+        return [_rec("critical", sid, "disk_full",
+                     f"Disk almost full ({disk:.0f}%) for {len(window)} consecutive samples{trend}; "
+                     "writes, logs and databases will start failing.",
+                     "Free space now: rotate / compress logs, clear caches and old builds "
+                     "(find the biggest with: du -xh / | sort -h | tail), or extend the volume.")]
+    if eta is not None and disk >= T["disk_fill_min"] and eta <= T["disk_fill_eta_min"]:
+        return [_rec("warning", sid, "disk_filling",
+                     f"Disk at {disk:.0f}% and rising {_f(rate)}%/min - full {when} at this rate.",
+                     "Find the fastest-growing directory (du -xh / | sort -h | tail) - often a runaway log - "
+                     "and rotate it, or extend the volume before it fills.")]
+    return []
+
+
+def login_rules(sid: str, hist: list[dict]) -> list[dict]:
+    """Brute-force burst: failed logins in the latest sample far above this node's own baseline."""
+    fails = hist[0].get("failed_logins")
+    if fails is None:
+        return []
+    # Baseline learns only from CLEAN samples (below the burst floor), so an attack that starts early or
+    # lasts long can never become the node's "normal" and silence its own alert.
+    clean = [h["failed_logins"] for h in hist[1:]
+             if h.get("failed_logins") is not None and h["failed_logins"] < T["fail_burst_min"]]
+    base = statistics.median(clean) if len(clean) >= 3 else 0
+    if fails >= max(T["fail_burst_min"], T["fail_burst_ratio"] * base):
+        span = hist[0]["ts_epoch"] - hist[1]["ts_epoch"] if len(hist) > 1 else None
+        within = f" within about {span:.0f}s" if span and 0 < span < 120 else " in the latest sample"
+        return [_rec("critical", sid, "failed_login_burst",
+                     f"{fails} failed logins{within} (node baseline about {_f(base)} per sample) - "
+                     "brute-force / password-guessing pattern.",
+                     "Block the source IPs (fail2ban / firewall), enforce key-only SSH or account lockout, "
+                     "and check for any successful login right after the burst.")]
+    return []
 
 
 def _availability(e: dict) -> tuple[float, str]:
@@ -430,7 +519,7 @@ def analyze(now: float | None = None) -> dict:
     replayed_5m = sum(1 for sid, ds in all_d.items() if sid not in skew for d in ds if d > REPLAY_DELAY_S)
     latest_ts: dict[str, float] = {}
 
-    nodes, recs, degraded, online = [], [], [], 0
+    nodes, recs, degraded, online, attacked = [], [], [], 0, []
     for sid, hist in sorted(history.items()):
         latest, prev = hist[0], hist[1:]
         # Baseline = median of earlier *clean* samples, so an ongoing incident doesn't become "normal".
@@ -455,7 +544,10 @@ def analyze(now: float | None = None) -> dict:
             if burst.get(sid, 0) >= 3 and sid not in skew:
                 pass        # replay in progress: the newest live sample is still in flight; avoid stale alerts
             else:
-                recs.extend(node_rules(sid, hist, base_lat, base_bw))
+                node_recs = node_rules(sid, hist, base_lat, base_bw)
+                recs.extend(node_recs)
+                if any(r["rule"] == "failed_login_burst" for r in node_recs):
+                    attacked.append(sid)
             if latest["packet_loss"] >= T["loss_poor"] or _lat_jump(
                     latest["latency_ms"], base_lat, T["lat_jump_ratio"], T["lat_jump_min_ms"]):
                 degraded.append(sid)
@@ -475,6 +567,12 @@ def analyze(now: float | None = None) -> dict:
             "last_seen_s": round(age, 1), "last_timestamp": latest["timestamp"],
             "events_window": stats[sid]["n"],
             "ingest_delay_s": round(statistics.median(delays[sid]), 2) if delays.get(sid) else None,
+            "disk_usage": latest.get("disk_usage"),
+            "disk_growth_per_min": round(g, 2) if (g := disk_growth(hist)) else None,
+            "failed_logins": latest.get("failed_logins"),
+            "failed_logins_5m": (sum(h["failed_logins"] for h in hist
+                                     if h.get("failed_logins") is not None and h["ts_epoch"] >= now - 300)
+                                 if any(h.get("failed_logins") is not None for h in hist) else None),
         })
         latest_ts[sid] = _availability(latest)[0]
 
@@ -485,6 +583,15 @@ def analyze(now: float | None = None) -> dict:
                          "Investigate the shared path (central SaaS ingress, core switch, ISP/gateway) "
                          "before touching individual nodes.", trigger_ts=max(latest_ts[d] for d in degraded)))
         recs[-1]["trigger_kind"] = "latest degraded sample available"
+
+    if len(attacked) >= 2:
+        recs.append(_rec("critical", None, "distributed_brute_force",
+                         f"{len(attacked)} nodes see failed-login bursts at the same time ({', '.join(attacked[:6])}) "
+                         "- distributed brute-force / credential-stuffing campaign.",
+                         "Block the attackers at the perimeter (firewall / NSG / WAF), rotate any exposed "
+                         "credentials and enforce MFA; one-node fixes will not stop it.",
+                         trigger_ts=max(latest_ts.get(a, now) for a in attacked)))
+        recs[-1]["trigger_kind"] = "latest burst sample available"
 
     track_alerts(db, recs, now)
     recs.sort(key=lambda r: SEVERITY_RANK[r["severity"]])
@@ -570,8 +677,10 @@ def ingest():
         with db:
             db.execute(
                 "INSERT INTO events (event_id, server_id, cpu_usage, memory_usage, bandwidth_mbps, latency_ms, "
+                "disk_usage, failed_logins, "
                 "packet_loss, health, timestamp, ts_epoch, received_at) VALUES "
                 "(:event_id, :server_id, :cpu_usage, :memory_usage, :bandwidth_mbps, :latency_ms, "
+                ":disk_usage, :failed_logins, "
                 ":packet_loss, :health, :timestamp, :ts_epoch, :received_at)", ev)
     except sqlite3.IntegrityError:   # same event_id already stored -> idempotent retry
         with db:
@@ -587,7 +696,7 @@ def events():
     except ValueError:
         limit = 100
     sql = ("SELECT event_id, server_id, cpu_usage, memory_usage, bandwidth_mbps, latency_ms, packet_loss, "
-           "health, timestamp, received_at FROM events")
+           "disk_usage, failed_logins, health, timestamp, received_at FROM events")
     args: tuple = ()
     if request.args.get("server_id"):
         sql += " WHERE server_id = ?"
@@ -615,6 +724,7 @@ def timeseries():
     rows = get_db().execute(
         "SELECT server_id, CAST(ts_epoch / ? AS INTEGER) AS b, AVG(ts_epoch) AS t, AVG(cpu_usage) AS cpu, "
         "AVG(memory_usage) AS mem, AVG(bandwidth_mbps) AS bw, AVG(latency_ms) AS lat, MAX(packet_loss) AS loss, "
+        "AVG(disk_usage) AS disk, SUM(failed_logins) AS fails, "
         "COUNT(*) AS n "
         "FROM events WHERE ts_epoch >= ? AND ts_epoch <= ? GROUP BY server_id, b ORDER BY server_id, b",
         (bucket, now - window, now + MAX_FUTURE_SKEW_S)).fetchall()
@@ -622,10 +732,11 @@ def timeseries():
     for r in rows:
         series.setdefault(r["server_id"], []).append(
             [round(r["t"], 3), round(r["cpu"], 1), round(r["mem"], 1), round(r["bw"], 3),
-             round(r["lat"], 2), round(r["loss"], 1), round(r["n"] * 60 / bucket, 1), r["b"]])
+             round(r["lat"], 2), round(r["loss"], 1), round(r["n"] * 60 / bucket, 1), r["b"],
+             None if r["disk"] is None else round(r["disk"], 1), r["fails"]])
     return jsonify(now=now, window_s=window, bucket_s=bucket,
                    fields=["t", "cpu_usage", "memory_usage", "bandwidth_mbps", "latency_ms", "packet_loss",
-                           "events_per_min", "bucket"],
+                           "events_per_min", "bucket", "disk_usage", "failed_logins"],
                    series=series)
 
 
@@ -814,16 +925,16 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 <section>
   <h2><span>🖥 Node Fleet</span><span class="muted">health: Excellent · Good · Fair · Poor · OFFLINE</span></h2>
   <div class="scroll"><table>
-    <thead><tr><th>Node</th><th>Status</th><th>CPU</th><th>Memory</th><th>Bandwidth</th><th>Latency (baseline)</th><th>Packet loss</th><th>Capture → SaaS</th><th>Last seen</th><th>Events (1h)</th></tr></thead>
-    <tbody id="fleet"><tr><td colspan="10" class="empty">No nodes reporting yet.</td></tr></tbody>
+    <thead><tr><th>Node</th><th>Status</th><th>CPU</th><th>Memory</th><th>Bandwidth</th><th>Latency (baseline)</th><th>Packet loss</th><th>Disk</th><th>Failed logins (5 min)</th><th>Capture → SaaS</th><th>Last seen</th><th>Events (1h)</th></tr></thead>
+    <tbody id="fleet"><tr><td colspan="12" class="empty">No nodes reporting yet.</td></tr></tbody>
   </table></div>
 </section>
 
 <section id="tbl-events">
   <h2><span>📡 Live Sanitized Telemetry</span><span class="muted">allow-listed fields only · newest first</span></h2>
   <div class="scroll"><table>
-    <thead><tr><th>Captured (UTC)</th><th>Event ID</th><th>Node</th><th>CPU %</th><th>Mem %</th><th>Mbps</th><th>Latency ms</th><th>Loss %</th><th>Reported health</th></tr></thead>
-    <tbody id="events"><tr><td colspan="9" class="empty">No events yet.</td></tr></tbody>
+    <thead><tr><th>Captured (UTC)</th><th>Event ID</th><th>Node</th><th>CPU %</th><th>Mem %</th><th>Mbps</th><th>Latency ms</th><th>Loss %</th><th>Disk %</th><th>Failed logins</th><th>Reported health</th></tr></thead>
+    <tbody id="events"><tr><td colspan="11" class="empty">No events yet.</td></tr></tbody>
   </table></div>
 </section>
 <footer>Bearer-auth ingest · schema allow-list · idempotent event_id · SQLite WAL · alert latency = collector interval (5s) + UI refresh (3s) &lt; 10s</footer>
@@ -972,6 +1083,8 @@ function nodeTip(id, ev) {
     {color: colorOf(id), value: num(n.memory_usage) + "%", label: "memory"},
     {color: colorOf(id), value: num(n.latency_ms, 2) + " ms", label: `latency (baseline ${n.baseline_latency_ms === null ? "learning" : num(n.baseline_latency_ms, 2)})`},
     {color: colorOf(id), value: num(n.packet_loss) + "%", label: "packet loss"},
+    {color: colorOf(id), value: n.disk_usage === null || n.disk_usage === undefined ? "—" : num(n.disk_usage) + "%", label: "disk used"},
+    {color: colorOf(id), value: n.failed_logins_5m === null || n.failed_logins_5m === undefined ? "—" : String(n.failed_logins_5m), label: "failed logins (5 min)"},
     {color: colorOf(id), value: num(n.bandwidth_mbps, 2), label: "Mbps"},
     {color: "#8b949e", value: ago(n.last_seen_s), label: "last seen"},
   ]);
@@ -1070,7 +1183,9 @@ const METRICS = [
   {i: 4, title: "Latency to SaaS", unit: "ms · TCP handshake", floor: 10, fmt: v => (v < 10 ? num(v, 2) : num(v, 0)) + " ms"},
   {i: 5, title: "Packet loss", unit: "% · failed probes", floor: 5, cap: 100, fmt: v => num(v) + "%"},
   {i: 3, title: "Bandwidth", unit: "Mbps · rx + tx", floor: 1, fmt: v => num(v, 2) + " Mbps"},
-  {i: 8, title: "Ingest rate", unit: "events / min · 30 s rolling, by capture time (gaps = outage, refilled on replay)", floor: 5, partial: true, fmt: v => num(v) + " / min"},
+  {i: 8, title: "Disk usage", unit: "% of system disk used", max: 100, fmt: v => num(v) + "%"},
+  {i: 9, title: "Failed logins", unit: "count per bucket · counted on the node, lines never sent", floor: 5, fmt: v => num(v, 0)},
+  {i: 10, title: "Ingest rate", unit: "events / min · 30 s rolling, by capture time (gaps = outage, refilled on replay)", floor: 5, partial: true, fmt: v => num(v) + " / min"},
 ];
 const charts = METRICS.map(m => {
   const card = document.createElement("div"); card.className = "chart";
@@ -1109,7 +1224,7 @@ function smoothRate(ts) {               // 30 s rolling rate: removes aliasing b
     for (const p of pts) {
       const span = Math.min(k, p[7] - first + 1);
       let sum = 0; for (let j = 0; j < span; j++) sum += cnt.get(p[7] - j) || 0;
-      p[8] = Math.round(sum / (span * ts.bucket_s) * 600) / 10;
+      p[10] = Math.round(sum / (span * ts.bucket_s) * 600) / 10;
     }
   }
   return ts;
@@ -1125,7 +1240,7 @@ function renderCharts() {
     c.cross = null;
     const w = Math.max(320, c.plot.clientWidth), pw = w - M.l - M.r, ph = CH - M.t - M.b;
     c.s.replaceChildren(); c.s.setAttribute("width", w); c.s.setAttribute("height", CH); c.s.setAttribute("viewBox", `0 0 ${w} ${CH}`);
-    let hi = 0; for (const [, pts] of vis) for (const p of pts) if (p[0] >= t0 && p[c.m.i] > hi) hi = p[c.m.i];
+    let hi = 0; for (const [, pts] of vis) for (const p of pts) if (p[0] >= t0 && p[c.m.i] !== null && p[c.m.i] > hi) hi = p[c.m.i];
     const step = niceStep(c.m.max || Math.max(c.m.floor, hi * 1.15), 4);
     const ymax = c.m.max || Math.min(c.m.cap || Infinity, Math.max(step, Math.ceil(Math.max(c.m.floor, hi * 1.15) / step) * step));
     const X = t => M.l + (t - t0) / (t1 - t0) * pw, Y = v => M.t + (1 - Math.min(v, ymax) / ymax) * ph;
@@ -1138,14 +1253,14 @@ function renderCharts() {
     const xs = [15, 30, 60, 120, 300, 600, 900, 1800].find(s => (t1 - t0) / s <= maxTicks) || 1800;
     for (let t = Math.ceil(t0 / xs) * xs; t <= t1; t += xs)
       text(c.s, {x: X(t), y: CH - 6, "text-anchor": "middle", "font-size": 11, fill: "#8b949e", style: "font-variant-numeric:tabular-nums"}, timeLabel(t, xs < 60));
-    if (!vis.some(([, pts]) => pts.length)) {
+    if (!vis.some(([, pts]) => pts.some(p => p[0] >= t0 && p[c.m.i] !== null && p[c.m.i] !== undefined))) {
       text(c.s, {x: M.l + pw / 2, y: M.t + ph / 2, "text-anchor": "middle", "font-size": 12, fill: "#8b949e"}, "No telemetry in this range yet");
       continue;
     }
     const ends = [];
     const curBucket = Math.floor(t1 / state.ts.bucket_s);
     for (const [id, all] of vis) {
-      const pts = c.m.partial ? all.filter(p => p[7] < curBucket) : all;
+      const pts = (c.m.partial ? all.filter(p => p[7] < curBucket) : all).filter(p => p[c.m.i] !== null && p[c.m.i] !== undefined);
       if (!pts.length) continue;
       let d = "", prev = null;
       for (const p of pts) {
@@ -1196,7 +1311,7 @@ function keyNav(c, ev) {
 function valuesAt(t, mi) {
   const tol = Math.max(state.ts.bucket_s * 1.5, 8), out = [];
   for (const [id, pts] of visibleSeries()) {
-    let best = null; for (const p of pts) if (Math.abs(p[0] - t) <= tol && (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t))) best = p;
+    let best = null; for (const p of pts) if (p[mi] !== null && p[mi] !== undefined && Math.abs(p[0] - t) <= tol && (!best || Math.abs(p[0] - t) < Math.abs(best[0] - t))) best = p;
     if (best) out.push({id, p: best, v: best[mi]});
   }
   return out;
@@ -1267,6 +1382,8 @@ function renderFleet(nodes) {
     <td>${num(n.bandwidth_mbps, 2)} Mbps</td>
     <td>${num(n.latency_ms)} ms <span class="muted">(${n.baseline_latency_ms === null ? "learning" : num(n.baseline_latency_ms)})</span></td>
     <td>${n.packet_loss >= 2 ? '<b style="color:var(--critical)">▲</b> ' : ""}${num(n.packet_loss)}%</td>
+    <td>${n.disk_usage === null || n.disk_usage === undefined ? '<span class="muted">—</span>' : meter(n.disk_usage, 90, 95) + (n.disk_growth_per_min ? ` <span class="muted">+${num(n.disk_growth_per_min, 2)}%/min</span>` : "")}</td>
+    <td>${n.failed_logins_5m === null || n.failed_logins_5m === undefined ? '<span class="muted">—</span>' : (n.failed_logins_5m >= 10 ? '<b style="color:var(--critical)">!</b> ' : "") + esc(n.failed_logins_5m)}</td>
     <td>${n.ingest_delay_s === null ? '<span class="muted">—</span>' : num(n.ingest_delay_s, 2) + " s"}</td>
     <td class="muted">${ago(n.last_seen_s)}</td><td>${esc(n.events_window)}</td></tr>`).join("");
 }
@@ -1277,7 +1394,8 @@ function renderEvents(evs) {
     <td class="mono muted">${esc(String(e.event_id).slice(0, 8))}…</td>
     <td class="mono"><span class="key" style="background:${colorOf(e.server_id)}"></span>${esc(e.server_id)}</td>
     <td>${num(e.cpu_usage)}</td><td>${num(e.memory_usage)}</td><td>${num(e.bandwidth_mbps, 2)}</td>
-    <td>${num(e.latency_ms)}</td><td>${num(e.packet_loss)}</td><td>${badge(e.health)}</td></tr>`).join("");
+    <td>${num(e.latency_ms)}</td><td>${num(e.packet_loss)}</td><td>${num(e.disk_usage)}</td>
+    <td>${e.failed_logins === null || e.failed_logins === undefined ? "—" : esc(e.failed_logins)}</td><td>${badge(e.health)}</td></tr>`).join("");
 }
 const dashDelays = [];                    // capture -> first shown in this browser (server-clock corrected)
 let dashSeen = null;

@@ -131,6 +131,29 @@ def secret_spans(text: str) -> list[tuple[int, int]]:
     return merged
 
 
+# Failed-login detector: ONE pattern per failed attempt (sshd also logs "pam_unix(sshd:auth): authentication
+# failure" for the same attempt, so that line is deliberately not counted). Only the COUNT leaves the node.
+FAILED_LOGIN_RE = re.compile(
+    r"(?i)failed (?:password|publickey|keyboard-interactive|none) for"
+    r"|FAILED LOGIN|FAILED SU|login incorrect|incorrect password attempt"
+    r"|pam_unix\((?!sshd)[^)]*:auth\): authentication failure"
+    r"|an account failed to log on|event id:?\s*4625")
+
+
+def count_failed_logins(lines) -> int:
+    return sum(1 for ln in lines if FAILED_LOGIN_RE.search(ln))
+
+
+def disk_usage_pct() -> float | None:
+    """% used of the system disk (/ on Linux, the system drive on Windows)."""
+    try:
+        root = (os.environ.get("SystemDrive", "C:") + "\\") if os.name == "nt" else "/"
+        u = shutil.disk_usage(root)
+        return 100.0 * u.used / u.total if u.total else None
+    except OSError:
+        return None
+
+
 DEMO_LOG_LINES = [   # synthetic, well-known example credentials - safe to publish
     "sshd[2211]: Failed password for admin from 10.108.72.90 port 52144 ssh2; debug pass=Hunter2!2026",
     "webapp[884]: POST /login user=alice@corp.example password=S3cr3t!Pass status=200",
@@ -148,6 +171,11 @@ DEMO_LOG_LINES = [   # synthetic, well-known example credentials - safe to publi
 class LogSource:
     def __init__(self, path: str | None, demo: bool):
         self.demo, self.first_read = demo, True
+        self.primed = False                 # the first read is history: shown, not counted
+        self.cursor: str | None = None      # journald cursor -> each line is read (and counted) once
+        self.win_security: bool | None = None
+        self.last_win: float | None = None
+        self.notes: list[str] = []
         self.kind, self.path, self.offset = "none", None, 0
         for p in ([path] if path else (LINUX_LOG_FILES if os.name != "nt" else [])):
             if p and os.path.isfile(p) and os.access(p, os.R_OK):
@@ -165,22 +193,65 @@ class LogSource:
         src = f"{self.kind}:{self.path}" if self.path else "none"
         return src + (" + synthetic demo secrets" if self.demo else "")
 
-    def read(self, n: int) -> list[str]:
+    def read(self, n: int) -> tuple[list[str], int | None]:
+        """(newest n lines for the proof panel, failed logins counted in ALL new lines - None if unknown)."""
+        failed = None
         try:
             if self.kind == "file":
                 lines = self._read_file()
             elif self.kind == "journalctl":
-                lines = self._run(["journalctl", "-n", str(n), "--no-pager", "-q", "-o", "short-iso"])
+                lines = self._read_journal(n)
             elif self.kind == "wevtutil":
                 lines = self._read_wevtutil(n)
             else:
                 lines = []
+            lines = [ln.rstrip() for ln in lines if ln.strip()]
+            if self.kind in ("file", "journalctl"):
+                failed = count_failed_logins(lines) if self.primed else 0
+            elif self.kind == "wevtutil":
+                failed = self._win_failed_logins()
         except (OSError, subprocess.SubprocessError) as exc:
             lines = [f"[collector] log source error: {exc}"]
-        lines = [ln.rstrip() for ln in lines if ln.strip()][-n:]
+        self.primed = True
+        lines = lines[-n:]
         if self.demo:
-            lines += random.sample(DEMO_LOG_LINES, 2)
-        return lines
+            demo = random.sample(DEMO_LOG_LINES, 2)
+            lines += demo
+            failed = (failed or 0) + count_failed_logins(demo)
+        return lines, failed
+
+    def _read_journal(self, n: int) -> list[str]:
+        cmd = ["journalctl", "--no-pager", "-q", "-o", "short-iso", "--show-cursor"]
+        if self.cursor:
+            cmd.append(f"--after-cursor={self.cursor}")
+        else:
+            cmd += ["-n", str(max(n, 20))]
+        out = []
+        for ln in self._run(cmd):
+            if ln.startswith("-- cursor: "):
+                self.cursor = ln[len("-- cursor: "):].strip()
+            else:
+                out.append(ln)
+        return out
+
+    def _win_failed_logins(self) -> int | None:
+        """Windows: count Security-log event 4625 (failed logon) since the last cycle. Needs an Administrator
+        terminal; without it we send no count rather than a misleading zero."""
+        if self.win_security is False:
+            return None
+        now = time.time()
+        window_ms = int(max(1.0, now - (self.last_win or now - 5)) * 1000)
+        self.last_win = now
+        query = f"*[System[(EventID=4625) and TimeCreated[timediff(@SystemTime) <= {window_ms}]]]"
+        r = subprocess.run(["wevtutil", "qe", "Security", f"/q:{query}", "/c:5000", "/f:text"],
+                           capture_output=True, text=True, errors="replace", timeout=10)
+        if r.returncode != 0:
+            self.win_security = False
+            self.notes.append("failed-login counts on Windows need an Administrator terminal (Security log); "
+                              "sending none")
+            return None
+        self.win_security = True
+        return r.stdout.count("Event[")
 
     def _read_file(self) -> list[str]:
         size = os.path.getsize(self.path)
@@ -441,6 +512,11 @@ def apply_chaos(mode: str, cpu, mem, bw, lat, loss):
     return cpu, mem, bw, lat, loss
 
 
+def chaos_disk(disk: float | None, step: int) -> float:
+    """Synthetic disk filling ~1.2 % per cycle from 86 %, to demo the predictive and disk-full alerts."""
+    return min(99.0, max(disk or 0.0, 86.0) + 1.2 * step)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -502,8 +578,12 @@ class DiskBuffer:
         return len(self.events)
 
 
+OPTIONAL_SEND_FIELDS = ("disk_usage", "failed_logins")
+
+
 class Shipper:
     def __init__(self, url: str, token: str, buffer_path: str):
+        self.compat = False                 # True once the SaaS rejected the optional fields (older deploy)
         self.url = url
         self.buffer = DiskBuffer(buffer_path)
         self.session = requests.Session()
@@ -512,6 +592,7 @@ class Shipper:
 
     def flush(self) -> dict:
         res = {"delivered": 0, "duplicates": 0, "deadlettered": 0, "error": None, "attempted": len(self.buffer),
+               "notes": [],
                "oldest": self.buffer.events[0]["timestamp"] if self.buffer.events else None, "last": None}
         q, i = self.buffer.events, 0
         while i < len(q):
@@ -532,6 +613,15 @@ class Shipper:
                 res["duplicates" if r.status_code == 200 else "delivered"] += 1
                 res["last"] = _safe_json(r)
                 i += 1
+            elif r.status_code == 400 and "allow-list" in str(_safe_json(r)) and \
+                    any(f in q[i] for f in OPTIONAL_SEND_FIELDS):
+                for f in OPTIONAL_SEND_FIELDS:           # older SaaS: resend this event without the new fields
+                    q[i].pop(f, None)
+                if not self.compat:
+                    self.compat = True
+                    res["notes"].append("SaaS does not accept disk_usage / failed_logins yet (older deploy) - "
+                                        "sending without them until the collector restarts")
+                continue
             elif r.status_code in (400, 413, 415, 422):   # poison event: park it, don't block the queue
                 self._deadletter(q[i], r)
                 res["deadlettered"] += 1
@@ -651,11 +741,16 @@ _ALIASES = {   # tried in order; matched case/punctuation-insensitively; overrid
     "packet_loss": ["packet_loss", "loss", "packetloss", "loss_pct", "loss_percent", "packet_loss_pct",
                     "pkt_loss", "drop_rate", "drops_pct"],
     "message": ["message", "msg", "log", "raw", "line", "text", "event", "body"],
+    "disk_usage": ["disk_usage", "disk", "disk_pct", "disk_percent", "disk_used_pct", "disk.used.pct",
+                   "fs_used_pct", "filesystem.used.pct", "system.filesystem.used.pct", "storage_pct"],
+    "failed_logins": ["failed_logins", "failed_login", "login_failures", "auth_failures", "failed_auth",
+                      "failed_logons", "failedlogins"],
 }
 ALIASES = {k: [_nk(a) for a in v] for k, v in _ALIASES.items()}
 STREAM_METRICS = ("cpu_usage", "memory_usage", "bandwidth_mbps", "latency_ms", "packet_loss")
-METRIC_CLAMP = {"cpu_usage": 100.0, "memory_usage": 100.0, "packet_loss": 100.0,
-                "latency_ms": 600_000.0, "bandwidth_mbps": 1_000_000.0}
+STREAM_OPTIONAL = ("disk_usage", "failed_logins")
+METRIC_CLAMP = {"cpu_usage": 100.0, "memory_usage": 100.0, "packet_loss": 100.0, "disk_usage": 100.0,
+                "latency_ms": 600_000.0, "bandwidth_mbps": 1_000_000.0, "failed_logins": 1_000_000.0}
 KV_RE = re.compile(r"""([A-Za-z_@][\w.@-]*)\s*[=:]\s*("[^"]*"|'[^']*'|[^\s,;]+)""")
 
 
@@ -694,20 +789,24 @@ def normalize_record(rec: dict, mapping: dict) -> dict:
     by = {}
     for k, v in rec.items():
         by.setdefault(_nk(k), (k, v))
-    out = {"metrics": {}, "host": None, "tenant": None, "ts": None}
+    out = {"metrics": {}, "optional": {}, "host": None, "tenant": None, "ts": None, "message": None}
     for field, cands in ALIASES.items():
         for alias in ([mapping[field]] if field in mapping else cands):
             if alias not in by:
                 continue
             key, val = by[alias]
-            if field in STREAM_METRICS:
+            if field in STREAM_METRICS or field in STREAM_OPTIONAL:
                 x = _num(val)
                 if x is None:
                     continue
-                if field in ("cpu_usage", "memory_usage", "packet_loss") and 0 <= x <= 1 and \
+                if field in ("cpu_usage", "memory_usage", "packet_loss", "disk_usage") and 0 <= x <= 1 and \
                         re.search(r"ratio|fraction|\.pct$", str(key).lower()):
                     x *= 100                                    # fractional percentages (e.g. metricbeat .pct)
-                out["metrics"][field] = min(max(x, 0.0), METRIC_CLAMP[field])
+                x = min(max(x, 0.0), METRIC_CLAMP[field])
+                out["metrics" if field in STREAM_METRICS else "optional"][field] = x
+            elif field == "message":
+                if isinstance(val, str):
+                    out["message"] = val
             elif field == "timestamp":
                 out["ts"] = _ts(val)
             elif field in ("server_id", "tenant") and str(val).strip():
@@ -860,26 +959,48 @@ class StreamSource:
         now = time.time()
         groups: dict[str, dict] = {}
         raw: list[str] = []
+
+        def group(sid: str) -> dict:
+            return groups.setdefault(sid, {"vals": {m: [] for m in STREAM_METRICS}, "ts": [], "disk": [],
+                                           "fails": 0, "fails_known": False})
+
         for line in lines:
             line = line.rstrip("\r\n")
             if not line.strip():
                 continue
             self.lines += 1
             raw.append(line)
-            for rec in self._parse(line):
+            recs = self._parse(line)
+            counted, line_host = False, None
+            for rec in recs:
                 self.records += 1
                 n = normalize_record(rec, self.mapping)
-                if not n["metrics"]:
-                    continue                          # log-only record: stays on this node
-                self.metric_records += 1
                 host = n["host"] or self.default_host
                 sid = re.sub(r"[^A-Za-z0-9._:-]", "-", f"{n['tenant']}:{host}" if n["tenant"] else host)[:64]
-                g = groups.setdefault(sid, {"vals": {m: [] for m in STREAM_METRICS}, "ts": []})
+                g = group(sid)
+                line_host = line_host or sid
+                if "failed_logins" in n["optional"]:             # the stream reports a count: trust it
+                    g["fails"] += int(n["optional"]["failed_logins"])
+                    g["fails_known"] = counted = True
+                elif n["message"] is not None:                   # otherwise count failure lines locally
+                    g["fails"] += 1 if FAILED_LOGIN_RE.search(n["message"]) else 0
+                    g["fails_known"] = counted = True
+                if "disk_usage" in n["optional"]:
+                    g["disk"].append(n["optional"]["disk_usage"])
+                if not n["metrics"]:
+                    continue                          # log-only record: its text stays on this node
+                self.metric_records += 1
                 for m, x in n["metrics"].items():
                     g["vals"][m].append(x)
                 g["ts"].append(n["ts"] or now)
+            if not counted and FAILED_LOGIN_RE.search(line):     # plain / key=value log text
+                g = group(line_host or self.default_host)
+                g["fails"] += 1
+                g["fails_known"] = True
         events = []
         for sid, g in groups.items():
+            if not g["ts"]:
+                continue                              # no metrics for this host in this window: nothing to send
             self.hosts.add(sid)
             vals = {}
             for m in STREAM_METRICS:
@@ -905,6 +1026,10 @@ class StreamSource:
                 "timestamp": datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="milliseconds")
                                      .replace("+00:00", "Z"),
             })
+            if g["disk"]:
+                events[-1]["disk_usage"] = round(sum(g["disk"]) / len(g["disk"]), 1)
+            if g["fails_known"]:
+                events[-1]["failed_logins"] = g["fails"]
         return sorted(events, key=lambda e: e["server_id"]), raw
 
     def pop_notes(self) -> list[str]:
@@ -973,7 +1098,7 @@ def parse_args():
     ap.add_argument("--log-lines", type=int, default=3, help="raw log lines per cycle (default 3)")
     ap.add_argument("--buffer", default=BUFFER_FILE, help=f"buffer file (default {BUFFER_FILE})")
     ap.add_argument("--demo", action="store_true", help="mix synthetic secret-bearing log lines into each cycle")
-    ap.add_argument("--chaos", choices=["cpu_loss", "latency", "memory", "bandwidth"],
+    ap.add_argument("--chaos", choices=["cpu_loss", "latency", "memory", "bandwidth", "disk", "bruteforce"],
                     help="synthetically perturb metrics to demo correlated anomalies")
     ap.add_argument("--chaos-after", type=int, default=4, help="cycles of normal data before chaos starts")
     ap.add_argument("--probe", choices=["auto", "tcp", "http"], default="auto",
@@ -1042,16 +1167,32 @@ def main() -> int:
             else:
                 cpu, mem, bw = sampler.sample()
                 lat, loss = prober.measure()
+                disk = disk_usage_pct()
+                raw, failed = logs.read(args.log_lines)
                 measured_loss = loss
                 if args.chaos and cycle > args.chaos_after:
                     cpu, mem, bw, lat, loss = apply_chaos(args.chaos, cpu, mem, bw, lat, loss)
+                    if args.chaos == "disk":
+                        disk = chaos_disk(disk, cycle - args.chaos_after)
+                    elif args.chaos == "bruteforce":
+                        failed = (failed or 0) + random.randint(25, 60)
                 events = [{   # allow-listed, numeric-only metadata; event_id = idempotency key fixed at capture
                     "event_id": uuid.uuid4().hex, "server_id": server_id,
                     "cpu_usage": round(cpu, 1), "memory_usage": round(mem, 1), "bandwidth_mbps": round(bw, 3),
                     "latency_ms": round(lat, 2), "packet_loss": round(loss, 1),
                     "health": local_health(cpu, mem, lat, loss), "timestamp": utc_now_iso(),
                 }]
-                raw = logs.read(args.log_lines)
+                if disk is not None:
+                    events[0]["disk_usage"] = round(disk, 1)
+                if failed is not None:
+                    events[0]["failed_logins"] = int(failed)
+                for note in logs.notes:
+                    print(f"{st.Y}! {note}{st.X}")
+                logs.notes.clear()
+            if shipper.compat:                         # SaaS predates the optional fields: keep proof == wire
+                for e in events:
+                    for f in OPTIONAL_SEND_FIELDS:
+                        e.pop(f, None)
             scrubbed, counts = [], {}
             for line in raw:
                 clean, c = scrub(line)
@@ -1091,6 +1232,8 @@ def main() -> int:
                     note = prober.observe(measured_loss, not res["error"] and sent > 0)
                     if note:
                         print(f"{st.Y}! {note}{st.X}")
+                for note in res["notes"]:
+                    print(f"{st.Y}! {note}{st.X}")
                 if res["deadlettered"]:
                     print(f"{st.Y}! {res['deadlettered']} event(s) rejected by schema -> {DEADLETTER_FILE}{st.X}")
             if args.once:

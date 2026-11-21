@@ -9,7 +9,9 @@ containing secrets and failed logins, and a repeating timeline of injected incid
    30-60 s    db-01     CPU 93-97 % + 10-15 % packet loss        -> cpu+packet_loss alert
    60-90 s    api-01    latency 20 -> 300+ ms + 5-8 % loss       -> latency_jump+packet_loss alert
    90-130 s   cache-01  goes silent                              -> OUTAGE, then recovers
+  100-125 s   web-01    6 failed SSH logins / s                   -> failed_login_burst alert
   130-160 s   web-01    memory 93 % + CPU 85 %                   -> memory+cpu alert
+  all along   db-01     disk fills 80 % -> 97 % every loop       -> disk_filling, then disk_full alert
   (then repeats)
 
 Usage:
@@ -27,6 +29,7 @@ from datetime import datetime, timezone
 HOSTS = ["web-01", "db-01", "api-01", "cache-01"]
 BASE = {"web-01": (25, 55, 8.0, 18), "db-01": (35, 62, 4.0, 12), "api-01": (30, 48, 6.0, 20),
         "cache-01": (15, 40, 12.0, 9)}            # cpu %, mem %, Mbps, rtt ms
+DISK = {"web-01": 54.0, "db-01": 80.0, "api-01": 61.0, "cache-01": 38.0}   # % used at the start of a loop
 LOGS = [
     "nginx[812]: 200 GET /api/v1/orders 34ms",
     "sshd[2211]: Failed password for root from 203.0.113.50 port 51432 ssh2",
@@ -55,10 +58,25 @@ def sample(host: str, t: float) -> dict | None:
         return None                                   # outage: host stops reporting
     if host == "web-01" and 130 <= phase < 160:
         mem, cpu = random.uniform(92, 96), random.uniform(84, 90)
+    disk = DISK[host] + (phase * 0.106 if host == "db-01" else 0) + random.uniform(-0.05, 0.05)
     msg = random.choice(LOGS) if random.random() < 0.6 else "heartbeat ok"
-    return {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            "host": host, "cpu": round(max(cpu, 0), 1), "mem": round(mem, 1), "net_mbps": round(bw, 2),
-            "rtt_ms": round(rtt, 1), "loss_pct": round(loss, 1), "msg": msg}
+    return {"ts": now_iso(), "host": host, "cpu": round(max(cpu, 0), 1), "mem": round(mem, 1),
+            "net_mbps": round(bw, 2), "rtt_ms": round(rtt, 1), "loss_pct": round(loss, 1),
+            "disk_pct": round(min(disk, 99.5), 1), "msg": msg}
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def attack_lines(t: float) -> list[dict]:
+    """Brute-force burst on web-01: log-only records (no metrics) carrying failed SSH logins."""
+    if not 100 <= t % 160 < 125:
+        return []
+    return [{"ts": now_iso(), "host": "web-01",
+             "msg": f"sshd[{random.randint(3000, 9000)}]: Failed password for invalid user admin from "
+                    f"198.51.100.{random.randint(2, 250)} port {random.randint(30000, 60000)} ssh2"}
+            for _ in range(6)]
 
 
 def render(rec: dict, fmt: str, header_done: list) -> str:
@@ -89,6 +107,9 @@ def main() -> None:
             for host in HOSTS:
                 rec = sample(host, t)
                 if rec:
+                    out.write(render(rec, args.format, header_done) + "\n")
+            if args.format == "jsonl":                # log-only records need a format with optional fields
+                for rec in attack_lines(t):
                     out.write(render(rec, args.format, header_done) + "\n")
             out.flush()
             time.sleep(1 / args.rate)

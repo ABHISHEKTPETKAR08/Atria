@@ -21,8 +21,20 @@ python collector.py --url http://127.0.0.1:5000/ingest --demo   # same machine
 python collector.py --target azure --app-name <app-name>        # -> https://<app-name>.azurewebsites.net/ingest
 ```
 Demo flags: `--demo` mixes synthetic secret-bearing log lines into the egress-proof panel;
-`--chaos {cpu_loss,latency,memory,bandwidth}` synthetically perturbs metrics after `--chaos-after` cycles so each
+`--chaos {cpu_loss,latency,memory,bandwidth,disk,bruteforce}` synthetically perturbs metrics after `--chaos-after` cycles so each
 correlation rule can be shown live. Kill `host.py` while a collector runs to demo buffering and replay.
+
+## Disk usage and failed logins (optional fields)
+Each event may also carry `disk_usage` (% of the system disk used) and `failed_logins` (failed login attempts
+counted **on the node** from the log lines read that cycle; only the number is sent, never the lines).
+- Linux: sshd / su / sudo / login failures from `/var/log/auth.log`, `/var/log/secure` or the systemd journal
+  (read incrementally with a journal cursor, so each attempt is counted once; run with `sudo` to see auth logs).
+- Windows: Security-log event 4625 (needs an Administrator terminal; otherwise no count is sent).
+- Stream mode: a `failed_logins`-style field is summed per host, or failure lines in a message field are counted.
+Both fields are optional: older collectors keep working (shown as "—"), and a new collector talking to an older
+SaaS automatically resends without them. AIOps adds `disk_filling` (predicted full within 30 min),
+`disk_full` (>= 95 % for 3 samples), `failed_login_burst` (>= 10 and >= 5x the node's baseline) and
+`distributed_brute_force` (bursts on 2+ nodes at once).
 
 ## Organiser telemetry stream (shared stream mode)
 The collector can consume the organiser's shared stream instead of local metrics. It auto-detects JSON / JSON lines /
