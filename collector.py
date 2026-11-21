@@ -498,7 +498,39 @@ def local_health(cpu: float, mem: float, lat: float, loss: float) -> str:   # mi
     return "Excellent"
 
 
-def apply_chaos(mode: str, cpu, mem, bw, lat, loss):
+CHAOS_MODES = ("cpu_loss", "latency", "memory", "bandwidth", "disk", "bruteforce")
+
+
+def parse_chaos(spec: str | None) -> list[str]:
+    """'cpu_loss,disk,bruteforce' -> ['cpu_loss', 'disk', 'bruteforce'] (several scenarios at once)."""
+    modes = [m.strip() for m in (spec or "").split(",") if m.strip()]
+    bad = [m for m in modes if m not in CHAOS_MODES]
+    if bad:
+        sys.exit(f"--chaos: unknown mode(s) {bad}; choose from {', '.join(CHAOS_MODES)} (comma-separated)")
+    return modes
+
+
+class SimBandwidth:
+    """Busy-server traffic profile: a smooth, mean-reverting random walk inside [lo, hi] Mbps."""
+
+    def __init__(self, spec: str):
+        try:
+            lo, hi = (float(x) for x in spec.replace(":", "-").split("-"))
+        except ValueError:
+            sys.exit("--sim-bandwidth: use LOW-HIGH in Mbps, e.g. 50-150")
+        if not 0 <= lo < hi:
+            sys.exit("--sim-bandwidth: need 0 <= LOW < HIGH")
+        self.lo, self.hi = lo, hi
+        self.v = random.uniform(lo, hi)
+
+    def next(self) -> float:
+        span, mid = self.hi - self.lo, (self.lo + self.hi) / 2
+        self.v += random.uniform(-0.18, 0.18) * span + 0.12 * (mid - self.v)
+        self.v = min(self.hi, max(self.lo, self.v))
+        return self.v
+
+
+def apply_chaos(mode: str, cpu, mem, bw, lat, loss, bw_ref: float | None = None):
     """Synthetic, clearly-labelled metric perturbation so judges can watch the AIOps rules fire."""
     u = random.uniform
     if mode == "cpu_loss":
@@ -507,8 +539,8 @@ def apply_chaos(mode: str, cpu, mem, bw, lat, loss):
         lat, loss = lat + u(250, 400), max(loss, u(4, 8))
     elif mode == "memory":
         mem, cpu = u(91, 96), u(80, 90)
-    elif mode == "bandwidth":
-        bw, lat = u(80, 150), lat + u(60, 120)
+    elif mode == "bandwidth":                 # a surge RELATIVE to this server's normal (busy servers too)
+        bw, lat = max((bw_ref or 0) * u(4, 6), u(80, 150)), lat + u(60, 120)
     return cpu, mem, bw, lat, loss
 
 
@@ -1098,8 +1130,13 @@ def parse_args():
     ap.add_argument("--log-lines", type=int, default=3, help="raw log lines per cycle (default 3)")
     ap.add_argument("--buffer", default=BUFFER_FILE, help=f"buffer file (default {BUFFER_FILE})")
     ap.add_argument("--demo", action="store_true", help="mix synthetic secret-bearing log lines into each cycle")
-    ap.add_argument("--chaos", choices=["cpu_loss", "latency", "memory", "bandwidth", "disk", "bruteforce"],
-                    help="synthetically perturb metrics to demo correlated anomalies")
+    ap.add_argument("--chaos", metavar="MODE[,MODE...]",
+                    help="synthetic scenarios, combinable with commas: " + ", ".join(CHAOS_MODES)
+                         + " (e.g. cpu_loss,bruteforce)")
+    ap.add_argument("--sim-bandwidth", metavar="LOW-HIGH",
+                    help="simulate a busy server: bandwidth varies smoothly within LOW-HIGH Mbps (e.g. 50-150)")
+    ap.add_argument("--sim-failed", type=int, default=0, metavar="N",
+                    help="background noise: 0..N failed logins per cycle (bursts above it still alert)")
     ap.add_argument("--chaos-after", type=int, default=4, help="cycles of normal data before chaos starts")
     ap.add_argument("--probe", choices=["auto", "tcp", "http"], default="auto",
                     help="latency/loss method: tcp handshakes, https round trips, or auto (default)")
@@ -1149,8 +1186,15 @@ def main() -> int:
         print(f"  probe      : {prober.describe()}")
     print(f"  metrics    : {'from stream fields' if stream else ('psutil' if psutil else 'stdlib (/proc or Win32)')}\n  buffer     : "
           f"{os.path.abspath(args.buffer)} ({len(shipper.buffer)} pending from previous run)")
-    if args.chaos:
-        print(f"  {st.Y}CHAOS MODE '{args.chaos}' after cycle {args.chaos_after}: metrics synthetically perturbed{st.X}")
+    chaos = parse_chaos(args.chaos)
+    sim_bw = SimBandwidth(args.sim_bandwidth) if args.sim_bandwidth else None
+    if sim_bw:
+        print(f"  {st.Y}SIMULATED TRAFFIC: bandwidth varies {sim_bw.lo:g}-{sim_bw.hi:g} Mbps (busy-server profile){st.X}")
+    if args.sim_failed:
+        print(f"  {st.Y}SIMULATED NOISE: 0-{args.sim_failed} background failed logins per cycle{st.X}")
+    if chaos:
+        print(f"  {st.Y}CHAOS MODE {'+'.join(chaos)} after cycle {args.chaos_after}: metrics synthetically perturbed{st.X}")
+    bw_history: list[float] = []              # this server's normal bandwidth, for a relative surge
 
     cycle, was_offline = 0, len(shipper.buffer) > 0
     try:
@@ -1170,12 +1214,21 @@ def main() -> int:
                 disk = disk_usage_pct()
                 raw, failed = logs.read(args.log_lines)
                 measured_loss = loss
-                if args.chaos and cycle > args.chaos_after:
-                    cpu, mem, bw, lat, loss = apply_chaos(args.chaos, cpu, mem, bw, lat, loss)
-                    if args.chaos == "disk":
-                        disk = chaos_disk(disk, cycle - args.chaos_after)
-                    elif args.chaos == "bruteforce":
-                        failed = (failed or 0) + random.randint(25, 60)
+                if sim_bw:
+                    bw = sim_bw.next()
+                if args.sim_failed:
+                    failed = (failed or 0) + random.randint(0, args.sim_failed)
+                if chaos and cycle > args.chaos_after:
+                    bw_ref = statistics.median(bw_history) if bw_history else None
+                    for mode in chaos:
+                        if mode in ("cpu_loss", "latency", "memory", "bandwidth"):
+                            cpu, mem, bw, lat, loss = apply_chaos(mode, cpu, mem, bw, lat, loss, bw_ref)
+                        elif mode == "disk":
+                            disk = chaos_disk(disk, cycle - args.chaos_after)
+                        elif mode == "bruteforce":
+                            failed = (failed or 0) + random.randint(25, 60)
+                else:
+                    bw_history = (bw_history + [bw])[-30:]
                 events = [{   # allow-listed, numeric-only metadata; event_id = idempotency key fixed at capture
                     "event_id": uuid.uuid4().hex, "server_id": server_id,
                     "cpu_usage": round(cpu, 1), "memory_usage": round(mem, 1), "bandwidth_mbps": round(bw, 3),

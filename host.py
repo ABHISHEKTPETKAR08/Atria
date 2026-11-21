@@ -319,6 +319,12 @@ def _rec(severity: str, node: str | None, rule: str, finding: str, action: str, 
             "message": f"{label} [{scope}]: {finding} Recommended Action: {action}"}
 
 
+def _quiet(vals: list[float]) -> float:
+    """Typical quiet level of a metric: its 25th percentile (robust to a long-running incident)."""
+    srt = sorted(vals)
+    return srt[(len(srt) - 1) // 4]
+
+
 def _pct(vals: list[float], q: float) -> float | None:
     """Nearest-rank percentile."""
     if not vals:
@@ -522,11 +528,12 @@ def analyze(now: float | None = None) -> dict:
     nodes, recs, degraded, online, attacked = [], [], [], 0, []
     for sid, hist in sorted(history.items()):
         latest, prev = hist[0], hist[1:]
-        # Baseline = median of earlier *clean* samples, so an ongoing incident doesn't become "normal".
+        # Baseline = the node's typical QUIET level: 25th percentile of earlier *clean* samples. An ongoing
+        # incident must fill ~3/4 of the history window before it is treated as the new normal.
         clean = [p for p in prev if p["packet_loss"] < T["loss_poor"]]
         ref = clean if len(clean) >= 3 else prev
-        base_lat = statistics.median(p["latency_ms"] for p in ref) if len(ref) >= 3 else None
-        base_bw = statistics.median(p["bandwidth_mbps"] for p in ref) if len(ref) >= 3 else None
+        base_lat = _quiet([p["latency_ms"] for p in ref]) if len(ref) >= 3 else None
+        base_bw = _quiet([p["bandwidth_mbps"] for p in ref]) if len(ref) >= 3 else None
         age = now - stats[sid]["last_rx"]
         health = classify(latest, base_lat)
         offline = age > OFFLINE_AFTER_S
