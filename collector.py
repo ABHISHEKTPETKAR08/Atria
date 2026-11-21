@@ -325,24 +325,92 @@ class MetricsSampler:
         return max(0.0, (cur - b0) * 8 / max(now - t0, 1e-3) / 1e6)
 
 
-def probe(host: str, port: int, count: int = 4, timeout: float = 0.8) -> tuple[float, float]:
-    """Latency = median TCP handshake RTT to the SaaS; packet loss = % of failed handshakes."""
-    try:
-        family, _, _, _, addr = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0]
-    except socket.gaierror:
-        return timeout * 1000, 100.0
-    rtts = []
-    for _ in range(count):
+class Prober:
+    """Latency + packet loss to the SaaS, measured the way the events actually travel.
+
+    tcp  : TCP handshakes, trying every resolved address IPv4-first (a broken IPv6 route or an
+           unreachable first address must not read as 100 % loss) and remembering the one that works.
+    http : lightweight HTTPS round trips to /health over the shipper's session - used when a proxy is
+           configured (direct TCP would bypass it) or, in auto mode, when raw TCP keeps failing while
+           HTTPS delivery succeeds (filtered networks).
+    """
+
+    def __init__(self, url: str, session, mode: str = "auto", count: int = 4, timeout: float = 0.8):
+        p = urlparse(url)
+        self.host, self.port = p.hostname, p.port or (443 if p.scheme == "https" else 80)
+        self.health_url = f"{p.scheme}://{p.netloc}/health"
+        self.session, self.count, self.timeout = session, count, timeout
+        self.proxy = requests.utils.select_proxy(url, requests.utils.get_environ_proxies(url))
+        self.auto = mode == "auto"
+        self.mode = mode if mode != "auto" else ("http" if self.proxy else "tcp")
+        self.good: tuple | None = None
+        self.streak = 0
+
+    def describe(self) -> str:
+        if self.mode == "http":
+            return "HTTPS round trips to /health" + (f" (via proxy {self.proxy})" if self.proxy else "")
+        return "TCP handshakes, all resolved addresses, IPv4 first" + (" (auto-fallback to HTTPS)" if self.auto else "")
+
+    def _addrs(self) -> list[tuple]:
+        infos = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        infos.sort(key=lambda i: i[0] != socket.AF_INET)
+        addrs = list(dict.fromkeys((i[0], i[4]) for i in infos))
+        if self.good in addrs:
+            addrs.remove(self.good)
+            addrs.insert(0, self.good)
+        return addrs
+
+    def _tcp_once(self, addrs) -> float | None:
+        for fam, addr in addrs:
+            t0 = time.perf_counter()
+            try:
+                with socket.socket(fam, socket.SOCK_STREAM) as s:
+                    s.settimeout(self.timeout)
+                    s.connect(addr)
+                self.good = (fam, addr)
+                return (time.perf_counter() - t0) * 1000
+            except OSError:
+                continue
+        return None
+
+    def _http_once(self) -> float | None:
         t0 = time.perf_counter()
         try:
-            with socket.socket(family, socket.SOCK_STREAM) as s:
-                s.settimeout(timeout)
-                s.connect(addr)
-            rtts.append((time.perf_counter() - t0) * 1000)
-        except OSError:
+            if self.session.get(self.health_url, timeout=(1.5, 1.5)).status_code < 500:
+                return (time.perf_counter() - t0) * 1000
+        except requests.RequestException:
             pass
-    loss = 100.0 * (count - len(rtts)) / count
-    return round(statistics.median(rtts) if rtts else timeout * 1000, 2), round(loss, 1)
+        return None
+
+    def measure(self) -> tuple[float, float]:
+        if self.mode == "tcp":
+            try:
+                addrs = self._addrs()
+            except socket.gaierror:
+                return self.timeout * 1000, 100.0
+            once = lambda: self._tcp_once(addrs)   # noqa: E731
+        else:
+            once = self._http_once
+        rtts: list[float | None] = []
+        for i in range(self.count):
+            rtts.append(once())
+            if i == 1 and rtts[0] is None and rtts[1] is None:   # target unreachable: don't burn the cycle
+                rtts += [None] * (self.count - 2)
+                break
+        ok = [r for r in rtts if r is not None]
+        loss = 100.0 * (self.count - len(ok)) / self.count
+        return round(statistics.median(ok) if ok else self.timeout * 1000, 2), round(loss, 1)
+
+    def observe(self, measured_loss: float, delivered: bool) -> str | None:
+        """Auto mode: raw TCP blocked while HTTPS delivery works => the probe, not the link, is broken."""
+        if not self.auto or self.mode != "tcp":
+            return None
+        self.streak = self.streak + 1 if (measured_loss >= 100 and delivered) else 0
+        if self.streak >= 2:
+            self.mode = "http"
+            return ("raw TCP probes fail on this network while HTTPS delivery works - "
+                    "switched to HTTPS round-trip probes")
+        return None
 
 
 def local_health(cpu: float, mem: float, lat: float, loss: float) -> str:   # mirrors Tier-2 thresholds
@@ -585,6 +653,8 @@ def parse_args():
     ap.add_argument("--chaos", choices=["cpu_loss", "latency", "memory", "bandwidth"],
                     help="synthetically perturb metrics to demo correlated anomalies")
     ap.add_argument("--chaos-after", type=int, default=4, help="cycles of normal data before chaos starts")
+    ap.add_argument("--probe", choices=["auto", "tcp", "http"], default="auto",
+                    help="latency/loss method: tcp handshakes, https round trips, or auto (default)")
     ap.add_argument("--once", action="store_true", help="run a single cycle and exit")
     ap.add_argument("--no-color", action="store_true")
     return ap.parse_args()
@@ -606,9 +676,11 @@ def main() -> int:
     server_id = args.server_id or detect_server_id(host, port)
     sampler, logs = MetricsSampler(), LogSource(args.log_file, args.demo)
     shipper = Shipper(url, args.token, args.buffer)
+    prober = Prober(url, shipper.session, args.probe)
 
     print(f"{st.B}Smart Observability · Tier-1 Edge Collector{st.X}")
     print(f"  node       : {server_id}\n  target     : {url}\n  log source : {logs.describe()}")
+    print(f"  probe      : {prober.describe()}")
     print(f"  metrics    : {'psutil' if psutil else 'stdlib (/proc or Win32)'}\n  buffer     : "
           f"{os.path.abspath(args.buffer)} ({len(shipper.buffer)} pending from previous run)")
     if args.chaos:
@@ -620,7 +692,8 @@ def main() -> int:
             cycle += 1
             started = time.monotonic()
             cpu, mem, bw = sampler.sample()
-            lat, loss = probe(host, port)
+            lat, loss = prober.measure()
+            measured_loss = loss
             if args.chaos and cycle > args.chaos_after:
                 cpu, mem, bw, lat, loss = apply_chaos(args.chaos, cpu, mem, bw, lat, loss)
 
@@ -659,6 +732,9 @@ def main() -> int:
                     srv = (res["last"] or {})
                     print(f"{st.G}✔ delivered -> {srv.get('status', 'ok')} (server health={srv.get('health', '?')})"
                           f" | buffer: {res['remaining']} pending{st.X}")
+                note = prober.observe(measured_loss, not res["error"] and sent > 0)
+                if note:
+                    print(f"{st.Y}! {note}{st.X}")
                 if res["deadlettered"]:
                     print(f"{st.Y}! {res['deadlettered']} event(s) rejected by schema -> {DEADLETTER_FILE}{st.X}")
             if args.once:
