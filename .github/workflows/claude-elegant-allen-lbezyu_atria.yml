@@ -8,6 +8,14 @@ on:
   push:
     branches:
       - 'claude/elegant-allen-lbezyu'
+    # Redeploy (and restart) the SaaS only when server-side files change.
+    # Collector / docs / script edits no longer restart the live app or reset its /tmp database.
+    paths:
+      - 'host.py'
+      - 'app.py'
+      - 'gunicorn.conf.py'
+      - 'requirements.txt'
+      - 'Procfile'
   workflow_dispatch:
 
 jobs:

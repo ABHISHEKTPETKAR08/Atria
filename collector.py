@@ -506,7 +506,15 @@ class Shipper:
         q, i = self.buffer.events, 0
         while i < len(q):
             try:
-                r = self.session.post(self.url, data=wire_bytes(q[i]), timeout=(3, 5))
+                r = self.session.post(self.url, data=wire_bytes(q[i]), timeout=(5, 20))
+            except requests.ReadTimeout:
+                res["error"] = ("SaaS accepted the connection but did not answer within 20s "
+                                "(app restarting / cold start / overloaded - network is fine)")
+                break
+            except requests.ConnectionError as exc:
+                kind = "DNS lookup failed" if "resolve" in str(exc).lower() or "name" in str(exc).lower() else "cannot connect"
+                res["error"] = f"SaaS unreachable - {kind} (check Wi-Fi / DNS / firewall)"
+                break
             except requests.RequestException as exc:
                 res["error"] = f"SaaS unreachable ({type(exc).__name__})"
                 break
